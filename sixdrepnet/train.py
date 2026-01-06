@@ -49,11 +49,11 @@ def parse_args():
         default='Pose_300W_LP', type=str) #Pose_300W_LP
     parser.add_argument(
         '--data_dir', dest='data_dir', help='Directory path for data.',
-        default='datasets/300W_LP', type=str)#BIWI_70_30_train.npz
+        default='../../../datasets/300W_LP', type=str)#BIWI_70_30_train.npz
     parser.add_argument(
         '--filename_list', dest='filename_list',
         help='Path to text file containing relative paths for every example.',
-        default='datasets/300W_LP/files.txt', type=str) #BIWI_70_30_train.npz #300W_LP/files.txt
+        default='../../../datasets/300W_LP/files.txt', type=str) #BIWI_70_30_train.npz #300W_LP/files.txt
     parser.add_argument(
         '--output_string', dest='output_string',
         help='String appended to output snapshots.', default='', type=str)
