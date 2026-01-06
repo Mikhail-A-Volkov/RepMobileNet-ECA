@@ -92,7 +92,7 @@ if __name__ == '__main__':
         os.makedirs('output/snapshots/{}'.format(summary_name))
 
     model = SixDRepNet(backbone_name='RepVGG-B1g2',
-                        backbone_file='RepVGG-B1g2-train.pth',
+                        backbone_file='../../../weights/RepVGG/RepVGG-B1g2-train.pth',
                         deploy=False,
                         pretrained=True)
  
