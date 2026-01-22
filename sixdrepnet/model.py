@@ -2,6 +2,7 @@ import math
 
 import torch
 from torch import nn
+from torchvision.models import mobilenet_v2
 
 from backbone.repvgg import get_RepVGG_func_by_name
 import utils
@@ -110,3 +111,48 @@ class SixDRepNet2(nn.Module):
         out = utils.compute_rotation_matrix_from_ortho6d(x)
 
         return out
+
+
+class SixDRepNet_MobileNetV2(nn.Module):
+    """
+    使用MobileNetV2作为backbone的6DRepNet模型
+    """
+    def __init__(self, pretrained=True):
+        super(SixDRepNet_MobileNetV2, self).__init__()
+        
+        # 加载预训练的MobileNetV2
+        mobilenet = mobilenet_v2(pretrained=pretrained)
+        
+        # 只使用特征提取部分，去掉分类器
+        self.features = mobilenet.features
+        
+        # 动态获取最后一层的输出通道数
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, 3, 224, 224)
+            dummy_output = self.features(dummy_input)
+            last_channel = dummy_output.shape[1]
+        
+        # 全局平均池化
+        self.gap = nn.AdaptiveAvgPool2d(output_size=1)
+        
+        # 特征维度（MobileNetV2通常是1280）
+        fea_dim = last_channel
+        
+        # 6D表示的回归层
+        self.linear_reg = nn.Linear(fea_dim, 6)
+    
+    def forward(self, x):
+        # 特征提取
+        x = self.features(x)  # [B, 1280, H/32, W/32]
+        
+        # 全局平均池化
+        x = self.gap(x)  # [B, 1280, 1, 1]
+        
+        # 展平
+        x = torch.flatten(x, 1)  # [B, 1280]
+        
+        # 6D表示回归
+        x = self.linear_reg(x)  # [B, 6]
+        
+        # 转换为旋转矩阵
+        return utils.compute_rotation_matrix_from_ortho6d(x)
