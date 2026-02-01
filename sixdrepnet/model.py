@@ -2,9 +2,9 @@ import math
 
 import torch
 from torch import nn
-from torchvision.models import mobilenet_v2
 
 from backbone.repvgg import get_RepVGG_func_by_name
+from backbone.mobilenet_v2 import mobilenet_v2
 import utils
 
 class SixDRepNet(nn.Module):
@@ -117,29 +117,53 @@ class SixDRepNet_MobileNetV2(nn.Module):
     """
     使用MobileNetV2作为backbone的6DRepNet模型
     """
-    def __init__(self, pretrained=True):
+    def __init__(self, backbone_file='../../../weights/RepVGG/mobilenet_v2-b0353104.pth', pretrained=True):
         super(SixDRepNet_MobileNetV2, self).__init__()
         
-        # 加载预训练的MobileNetV2
-        mobilenet = mobilenet_v2(pretrained=pretrained)
+        # 创建MobileNetV2 backbone（手动实现）
+        mobilenet = mobilenet_v2(pretrained=False)
         
-        # 只使用特征提取部分，去掉分类器
+        # 加载预训练权重
+        if pretrained and backbone_file:
+            try:
+                checkpoint = torch.load(backbone_file, map_location='cpu')
+                # 处理不同的权重文件格式
+                if 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                elif isinstance(checkpoint, dict) and 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                else:
+                    state_dict = checkpoint
+                
+                # 移除可能的module.前缀
+                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+                
+                # 只加载features部分的权重（去掉classifier部分）
+                features_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith('features.'):
+                        features_dict[k] = v
+                    elif not k.startswith('classifier.'):
+                        # 如果没有features前缀，直接使用
+                        features_dict[k] = v
+                
+                mobilenet.features.load_state_dict(features_dict, strict=False)
+                print(f'Loaded pretrained weights from {backbone_file}')
+            except Exception as e:
+                print(f'Warning: Failed to load pretrained weights from {backbone_file}: {e}')
+                print('Training from scratch...')
+        
+        # 只使用特征提取部分
         self.features = mobilenet.features
         
-        # 动态获取最后一层的输出通道数
-        with torch.no_grad():
-            dummy_input = torch.zeros(1, 3, 224, 224)
-            dummy_output = self.features(dummy_input)
-            last_channel = dummy_output.shape[1]
+        # 获取最后一层的输出通道数（MobileNetV2通常是1280）
+        self.last_channel = mobilenet.last_channel
         
         # 全局平均池化
         self.gap = nn.AdaptiveAvgPool2d(output_size=1)
         
-        # 特征维度（MobileNetV2通常是1280）
-        fea_dim = last_channel
-        
         # 6D表示的回归层
-        self.linear_reg = nn.Linear(fea_dim, 6)
+        self.linear_reg = nn.Linear(self.last_channel, 6)
     
     def forward(self, x):
         # 特征提取

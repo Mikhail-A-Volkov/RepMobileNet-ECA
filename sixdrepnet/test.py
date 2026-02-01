@@ -6,7 +6,6 @@ import os
 import argparse
 
 import numpy as np
-from numpy.lib.function_base import _quantile_unchecked
 import cv2
 import torch
 import torch.nn as nn
@@ -20,7 +19,7 @@ from matplotlib import pyplot as plt
 from PIL import Image
 matplotlib.use('TkAgg')
 
-from model import SixDRepNet
+from model import SixDRepNet, SixDRepNet_MobileNetV2
 import utils
 import datasets
 
@@ -51,7 +50,9 @@ def parse_args():
     parser.add_argument('--dataset',
                         dest='dataset', help='Dataset type.',
                         default='AFLW2000', type=str)
-
+    parser.add_argument('--backbone',
+                        dest='backbone', help='Backbone type: RepVGG or MobileNetV2',
+                        default='RepVGG', type=str)
 
     args = parser.parse_args()
     return args
@@ -68,10 +69,19 @@ if __name__ == '__main__':
     cudnn.enabled = True
     gpu = args.gpu_id
     snapshot_path = args.snapshot
-    model = SixDRepNet(backbone_name='RepVGG-B1g2',
-                        backbone_file='',
-                        deploy=True,
-                        pretrained=False)
+    
+    # 根据backbone类型创建模型
+    if args.backbone == 'MobileNetV2':
+        model = SixDRepNet_MobileNetV2(
+            backbone_file='../../../weights/RepVGG/mobilenet_v2-b0353104.pth',
+            pretrained=False)
+        print('Using MobileNetV2 backbone')
+    else:
+        model = SixDRepNet(backbone_name='RepVGG-B1g2',
+                          backbone_file='',
+                          deploy=True,
+                          pretrained=False)
+        print('Using RepVGG-B1g2 backbone')
 
     print('Loading data.')
 

@@ -4,14 +4,14 @@ import re
 import sys
 import os
 import argparse
+import datetime
 
 import numpy as np
-from numpy.lib.function_base import _quantile_unchecked
 import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split
 from torch.backends import cudnn
 from torch.utils import model_zoo
 import torchvision
@@ -22,10 +22,13 @@ from PIL import Image
 # matplotlib.use('TkAgg')
 matplotlib.use('Agg')
 
-from model import SixDRepNet, SixDRepNet2
+from model import SixDRepNet, SixDRepNet2, SixDRepNet_MobileNetV2
 import datasets
 from loss import GeodesicLoss
-
+import utils
+import json
+from model_profiler import profile_model
+from model_profiler import profile_model
 
 def parse_args():
     """Parse input arguments."""
@@ -45,6 +48,12 @@ def parse_args():
         '--lr', dest='lr', help='Base learning rate.',
         default=0.0001, type=float)
     parser.add_argument('--scheduler', default=False, type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--scheduler_type', dest='scheduler_type', 
+                       help='Scheduler type: MultiStepLR or ReduceLROnPlateau',
+                       default='MultiStepLR', type=str)
+    parser.add_argument('--grad_clip', dest='grad_clip', 
+                       help='Gradient clipping value (0 to disable)',
+                       default=0.0, type=float)
     parser.add_argument(
         '--dataset', dest='dataset', help='Dataset type.',
         default='Pose_300W_LP', type=str) #Pose_300W_LP
@@ -61,6 +70,28 @@ def parse_args():
     parser.add_argument(
         '--snapshot', dest='snapshot', help='Path of model snapshot.',
         default='', type=str)
+    parser.add_argument(
+        '--backbone', dest='backbone', help='Backbone type: RepVGG or MobileNetV2',
+        default='RepVGG', type=str)
+    parser.add_argument(
+        '--val_split', dest='val_split', 
+        help='Validation split ratio from training set (e.g., 0.1 for 10%%)',
+        default=0.1, type=float)
+    parser.add_argument(
+        '--val_dataset', dest='val_dataset', 
+        help='Validation dataset type. If None, will split from training set. Otherwise use separate dataset (not recommended).',
+        default=None, type=str)
+    parser.add_argument(
+        '--val_data_dir', dest='val_data_dir', help='Directory path for validation data (only used if val_dataset is specified).',
+        default=None, type=str)
+    parser.add_argument(
+        '--val_filename_list', dest='val_filename_list',
+        help='Path to text file containing relative paths for validation examples (only used if val_dataset is specified).',
+        default=None, type=str)
+    parser.add_argument(
+        '--val_seed', dest='val_seed', 
+        help='Random seed for train/val split',
+        default=42, type=int)
 
     args = parser.parse_args()
     return args
@@ -71,6 +102,107 @@ def load_filtered_state_dict(model, snapshot):
     snapshot = {k: v for k, v in snapshot.items() if k in model_dict}
     model_dict.update(snapshot)
     model.load_state_dict(model_dict)
+
+
+def validate(model, val_loader, criterion, gpu):
+    """在验证集上评估模型"""
+    model.eval()
+    total_loss = 0.0
+    total_samples = 0
+    
+    yaw_error = pitch_error = roll_error = 0.0
+    
+    with torch.no_grad():
+        for images, r_label, cont_labels, _ in val_loader:
+            images = images.cuda(gpu)
+            R_gt = r_label.cuda(gpu)
+            
+            # 预测
+            R_pred = model(images)
+            
+            # 计算损失
+            loss = criterion(R_gt, R_pred)
+            total_loss += loss.item() * images.size(0)
+            total_samples += images.size(0)
+            
+            # 计算欧拉角误差
+            # 注意：compute_euler_angles_from_rotation_matrices返回的是[x, y, z]
+            # 根据get_R函数：x=pitch, y=yaw, z=roll
+            euler_pred = utils.compute_euler_angles_from_rotation_matrices(R_pred) * 180 / np.pi
+            
+            # 处理cont_labels：如果为空列表或列表，从旋转矩阵计算欧拉角
+            # DataLoader收集批次时，如果原始数据是空列表，会保持为列表
+            if isinstance(cont_labels, list):
+                # 从旋转矩阵计算ground truth欧拉角
+                # compute_euler_angles返回[pitch, yaw, roll] = [x, y, z]
+                euler_gt = utils.compute_euler_angles_from_rotation_matrices(R_gt.cpu()) * 180 / np.pi
+            elif isinstance(cont_labels, torch.Tensor) and cont_labels.size(0) > 0:
+                # cont_labels是tensor，格式通常是[yaw, pitch, roll]（根据数据集代码）
+                # 需要转换为[pitch, yaw, roll]格式以匹配euler_pred
+                if len(cont_labels.shape) == 2 and cont_labels.size(1) == 3:
+                    # cont_labels格式：[yaw, pitch, roll]（弧度）
+                    euler_gt_rad = cont_labels.float()
+                    # 转换为[pitch, yaw, roll]格式并转换为度数
+                    euler_gt = torch.stack([
+                        euler_gt_rad[:, 1],  # pitch
+                        euler_gt_rad[:, 0],  # yaw
+                        euler_gt_rad[:, 2]   # roll
+                    ], dim=1) * 180 / np.pi
+                else:
+                    # 如果格式不对，从旋转矩阵计算
+                    euler_gt = utils.compute_euler_angles_from_rotation_matrices(R_gt.cpu()) * 180 / np.pi
+            else:
+                # 其他情况，从旋转矩阵计算
+                euler_gt = utils.compute_euler_angles_from_rotation_matrices(R_gt.cpu()) * 180 / np.pi
+            
+            # 欧拉角顺序：[pitch, yaw, roll] = [x, y, z]（与compute_euler_angles一致）
+            p_gt_deg = euler_gt[:, 0]  # pitch (x)
+            y_gt_deg = euler_gt[:, 1]  # yaw (y)
+            r_gt_deg = euler_gt[:, 2]  # roll (z)
+            
+            p_pred_deg = euler_pred[:, 0].cpu()  # pitch
+            y_pred_deg = euler_pred[:, 1].cpu()  # yaw
+            r_pred_deg = euler_pred[:, 2].cpu()  # roll
+            
+            # 计算角度误差（考虑周期性）
+            pitch_error += torch.sum(torch.min(torch.stack((
+                torch.abs(p_gt_deg - p_pred_deg), 
+                torch.abs(p_pred_deg + 360 - p_gt_deg), 
+                torch.abs(p_pred_deg - 360 - p_gt_deg), 
+                torch.abs(p_pred_deg + 180 - p_gt_deg), 
+                torch.abs(p_pred_deg - 180 - p_gt_deg)
+            )), 0)[0]).item()
+            
+            yaw_error += torch.sum(torch.min(torch.stack((
+                torch.abs(y_gt_deg - y_pred_deg), 
+                torch.abs(y_pred_deg + 360 - y_gt_deg), 
+                torch.abs(y_pred_deg - 360 - y_gt_deg), 
+                torch.abs(y_pred_deg + 180 - y_gt_deg), 
+                torch.abs(y_pred_deg - 180 - y_gt_deg)
+            )), 0)[0]).item()
+            
+            roll_error += torch.sum(torch.min(torch.stack((
+                torch.abs(r_gt_deg - r_pred_deg), 
+                torch.abs(r_pred_deg + 360 - r_gt_deg), 
+                torch.abs(r_pred_deg - 360 - r_gt_deg), 
+                torch.abs(r_pred_deg + 180 - r_gt_deg), 
+                torch.abs(r_pred_deg - 180 - r_gt_deg)
+            )), 0)[0]).item()
+    
+    avg_loss = total_loss / total_samples
+    avg_yaw_error = yaw_error / total_samples
+    avg_pitch_error = pitch_error / total_samples
+    avg_roll_error = roll_error / total_samples
+    avg_mae = (avg_yaw_error + avg_pitch_error + avg_roll_error) / 3.0
+    
+    model.train()
+    return {
+        'loss': avg_loss,
+        'yaw_error': avg_yaw_error,
+        'pitch_error': avg_pitch_error,
+        'roll_error': avg_roll_error,
+        'mae': avg_mae
+    }
 
 
 if __name__ == '__main__':
@@ -85,20 +217,34 @@ if __name__ == '__main__':
     if not os.path.exists('output/snapshots'):
         os.makedirs('output/snapshots')
 
+    # summary_name = '{}_{}_bs{}'.format(
+    #     'SixDRepNet', int(time.time()), args.batch_size)
+    current_time = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     summary_name = '{}_{}_bs{}'.format(
-        'SixDRepNet', int(time.time()), args.batch_size)
+        'SixDRepNet', current_time, args.batch_size)
 
     if not os.path.exists('output/snapshots/{}'.format(summary_name)):
         os.makedirs('output/snapshots/{}'.format(summary_name))
 
-    model = SixDRepNet(backbone_name='RepVGG-B1g2',
-                        backbone_file='../../../weights/RepVGG/RepVGG-B1g2-train.pth',
-                        deploy=False,
-                        pretrained=True)
+    # 创建模型
+    if args.backbone == 'MobileNetV2':
+        model = SixDRepNet_MobileNetV2(
+            backbone_file='../../../weights/RepVGG/mobilenet_v2-b0353104.pth',
+            pretrained=True)
+        backbone_name = 'MobileNetV2'
+    else:
+        model = SixDRepNet(backbone_name='RepVGG-B1g2',
+                          backbone_file='../../../weights/RepVGG/RepVGG-B1g2-train.pth',
+                          deploy=False,
+                          pretrained=True)
+        backbone_name = 'RepVGG-B1g2'
  
     if not args.snapshot == '':
         saved_state_dict = torch.load(args.snapshot)
-        model.load_state_dict(saved_state_dict['model_state_dict'])
+        if 'model_state_dict' in saved_state_dict:
+            model.load_state_dict(saved_state_dict['model_state_dict'])
+        else:
+            model.load_state_dict(saved_state_dict)
 
     print('Loading data.')
 
@@ -110,29 +256,141 @@ if __name__ == '__main__':
                                           transforms.ToTensor(),
                                           normalize])
 
-    pose_dataset = datasets.getDataset(
+    # 加载完整训练集
+    full_dataset = datasets.getDataset(
         args.dataset, args.data_dir, args.filename_list, transformations)
 
+    # 准备验证集：从训练集中划分或使用独立数据集
+    val_transformations = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        normalize
+    ])
+    
+    if args.val_dataset is not None:
+        # 使用独立的验证数据集（不推荐，但保留此选项）
+        print(f'Using separate validation dataset: {args.val_dataset}')
+        val_dataset = datasets.getDataset(
+            args.val_dataset, args.val_data_dir, args.val_filename_list, 
+            val_transformations, train_mode=False)
+        train_dataset = full_dataset
+    else:
+        # 从训练集中划分验证集（推荐方式）
+        dataset_size = len(full_dataset)
+        val_size = int(dataset_size * args.val_split)
+        train_size = dataset_size - val_size
+        
+        # 使用固定随机种子保证可复现
+        generator = torch.Generator().manual_seed(args.val_seed)
+        train_indices, val_indices = random_split(
+            list(range(dataset_size)), [train_size, val_size], generator=generator
+        )
+        
+        print(f'Train/Val split: {train_size}/{val_size} (ratio: {args.val_split*100:.1f}%)')
+        print(f'Using random seed {args.val_seed} for train/val split')
+        
+        # 创建训练数据集（使用训练transform，包含数据增强）
+        train_dataset = torch.utils.data.Subset(full_dataset, train_indices.indices)
+        
+        # 创建验证数据集（使用验证transform，不包含数据增强）
+        # 需要创建新的数据集实例，使用验证集的transform
+        val_dataset_full = datasets.getDataset(
+            args.dataset, args.data_dir, args.filename_list, 
+            val_transformations)
+        val_dataset = torch.utils.data.Subset(val_dataset_full, val_indices.indices)
+    
     train_loader = torch.utils.data.DataLoader(
-        dataset=pose_dataset,
+        dataset=train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=4)
+    
+    val_loader = torch.utils.data.DataLoader(
+        dataset=val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=2)
 
     model.cuda(gpu)
+    
+    # 模型分析：在训练开始前分析模型结构（仅执行一次）
+    print('='*70)
+    print('Model Profiling'.center(70))
+    print('='*70)
+    try:
+        # 获取一个样本batch用于分析
+        sample_batch = next(iter(train_loader))
+        sample_images = sample_batch[0]  # 获取images
+        if isinstance(sample_images, torch.Tensor):
+            sample_images = sample_images[:1].cuda(gpu)  # 只取第一个样本，减少计算
+        else:
+            sample_images = sample_images[0:1].cuda(gpu) if len(sample_images) > 0 else sample_images.cuda(gpu)
+        
+        # 执行模型分析
+        profile_model(
+            model=model,
+            sample_input=sample_images,
+            backbone_name=backbone_name,
+            output_dir='output/snapshots/{}'.format(summary_name),
+            device=f'cuda:{gpu}' if gpu >= 0 else 'cpu'
+        )
+    except Exception as e:
+        print(f'Warning: Model profiling failed: {e}')
+        print('Training will continue without profiling...')
+        import traceback
+        traceback.print_exc()
+    print('='*70)
+    print('')
+    
     crit = GeodesicLoss().cuda(gpu) #torch.nn.MSELoss().cuda(gpu)
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
 
 
-    #milestones = np.arange(num_epochs)
-    milestones = [10, 20]
-    scheduler = torch.optim.lr_scheduler.MultiStepLR(
-        optimizer, milestones=milestones, gamma=0.5)
+    # 学习率调度器配置
+    scheduler = None
+    if b_scheduler:
+        if args.scheduler_type == 'ReduceLROnPlateau':
+            # 基于验证损失的动态学习率调整
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-6)
+            print('Using ReduceLROnPlateau scheduler (based on validation loss)')
+        else:
+            # MultiStepLR - 在多个epoch降低学习率
+            milestones = [int(num_epochs * 0.3), int(num_epochs * 0.6), int(num_epochs * 0.8)]
+            scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                optimizer, milestones=milestones, gamma=0.5)
+            print(f'Using MultiStepLR scheduler with milestones: {milestones}')
+    else:
+        print('No learning rate scheduler enabled. Learning rate will remain constant.')
+    
+    # 判断是否使用Plateau调度器（需要在scheduler创建后判断）
+    use_plateau_scheduler = (b_scheduler and scheduler is not None and 
+                            isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau))
+    
+    # 初始化训练历史记录
+    training_history = {
+        'train_loss': [],
+        'val_loss': [],
+        'val_mae': [],
+        'val_yaw_error': [],
+        'val_pitch_error': [],
+        'val_roll_error': [],
+        'learning_rate': [],
+        'epoch': []
+    }
+    
+    # 最佳模型跟踪
+    best_val_loss = float('inf')
+    best_val_mae = float('inf')
+    best_epoch = -1
 
     print('Starting training.')
     for epoch in range(num_epochs):
+        model.train()
         loss_sum = .0
         iter = 0
+        
         for i, (images, gt_mat, _, _) in enumerate(train_loader):
             iter += 1
             images = torch.Tensor(images).cuda(gpu)
@@ -145,31 +403,122 @@ if __name__ == '__main__':
 
             optimizer.zero_grad()
             loss.backward()
+            
+            # 梯度裁剪（如果启用）
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            
             optimizer.step()
 
             loss_sum += loss.item()
 
             if (i+1) % 100 == 0:
-                print('Epoch [%d/%d], Iter [%d/%d] Loss: '
-                      '%.6f' % (
-                          epoch+1,
-                          num_epochs,
-                          i+1,
-                          len(pose_dataset)//batch_size,
-                          loss.item(),
-                      )
-                      )
+                print('Epoch [%d/%d], Iter [%d/%d] Loss: %.6f' % (
+                    epoch+1, num_epochs, i+1, len(train_dataset)//batch_size, loss.item()))
         
-        if b_scheduler:
-            scheduler.step()
-
-        # Save models at numbered epochs.
-        if epoch % 1 == 0 and epoch < num_epochs:
-            print('Taking snapshot...',
-                  torch.save({
-                      'epoch': epoch,
-                      'model_state_dict': model.state_dict(),
-                      'optimizer_state_dict': optimizer.state_dict(),
-                  }, 'output/snapshots/' + summary_name + '/' + args.output_string +
-                      '_epoch_' + str(epoch+1) + '.tar')
-                  )
+        # 计算平均训练损失
+        avg_train_loss = loss_sum / iter
+        
+        # 验证集评估
+        print('Validating...')
+        val_metrics = validate(model, val_loader, crit, gpu)
+        
+        # 学习率调度（根据scheduler类型）
+        if b_scheduler and scheduler is not None:
+            if use_plateau_scheduler:
+                # ReduceLROnPlateau需要传入验证损失
+                scheduler.step(val_metrics['loss'])
+                current_lr = optimizer.param_groups[0]['lr']
+            else:
+                # MultiStepLR在epoch结束时更新
+                scheduler.step()
+                if hasattr(scheduler, 'get_last_lr'):
+                    current_lr = scheduler.get_last_lr()[0]
+                else:
+                    current_lr = optimizer.param_groups[0]['lr']
+        else:
+            current_lr = optimizer.param_groups[0]['lr']
+        
+        # 记录训练历史
+        training_history['epoch'].append(epoch + 1)
+        training_history['train_loss'].append(avg_train_loss)
+        training_history['val_loss'].append(val_metrics['loss'])
+        training_history['val_mae'].append(val_metrics['mae'])
+        training_history['val_yaw_error'].append(val_metrics['yaw_error'])
+        training_history['val_pitch_error'].append(val_metrics['pitch_error'])
+        training_history['val_roll_error'].append(val_metrics['roll_error'])
+        training_history['learning_rate'].append(current_lr)
+        
+        # 打印epoch总结
+        print('Epoch [%d/%d] Summary:' % (epoch+1, num_epochs))
+        print('  Train Loss: %.6f' % avg_train_loss)
+        print('  Val Loss: %.6f' % val_metrics['loss'])
+        print('  Val MAE: %.4f (Yaw: %.4f, Pitch: %.4f, Roll: %.4f)' % (
+            val_metrics['mae'], val_metrics['yaw_error'], 
+            val_metrics['pitch_error'], val_metrics['roll_error']))
+        print('  Learning Rate: %.8f' % current_lr)
+        
+        # 如果角度误差异常大，给出警告
+        if val_metrics['yaw_error'] > 30 or val_metrics['pitch_error'] > 30:
+            print('  WARNING: Large angle errors detected! This may indicate:')
+            print('    - Data preprocessing issues (angle unit conversion)')
+            print('    - Model capacity limitations')
+            print('    - Training instability')
+            print('    - Consider checking data distribution and model architecture')
+        
+        # 保存训练历史（每个epoch都保存）
+        history_path = 'output/snapshots/{}/training_history.json'.format(summary_name)
+        with open(history_path, 'w') as f:
+            json.dump(training_history, f, indent=2)
+        
+        # 保存最佳模型（基于验证损失）
+        is_best = False
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
+            best_val_mae = val_metrics['mae']
+            best_epoch = epoch + 1
+            is_best = True
+        
+        # 保存检查点（包含完整训练状态）
+        checkpoint = {
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
+            'train_loss': avg_train_loss,
+            'val_loss': val_metrics['loss'],
+            'val_mae': val_metrics['mae'],
+            'val_yaw_error': val_metrics['yaw_error'],
+            'val_pitch_error': val_metrics['pitch_error'],
+            'val_roll_error': val_metrics['roll_error'],
+            'best_val_loss': best_val_loss,
+            'best_val_mae': best_val_mae,
+            'best_epoch': best_epoch,
+            'learning_rate': current_lr,
+            'batch_size': batch_size,
+            'num_epochs': num_epochs,
+            'backbone': backbone_name,
+            'model_config': {
+                'backbone': backbone_name,
+                'deploy': False,
+            },
+            'training_history': training_history
+        }
+        
+        checkpoint_path = 'output/snapshots/{}/{}checkpoint_epoch_{}.tar'.format(
+            summary_name, args.output_string + '_' if args.output_string else '', epoch + 1)
+        torch.save(checkpoint, checkpoint_path)
+        
+        # 保存最佳模型
+        if is_best:
+            best_model_path = 'output/snapshots/{}/{}best_model.tar'.format(
+                summary_name, args.output_string + '_' if args.output_string else '')
+            torch.save(checkpoint, best_model_path)
+            print('  *** New best model saved! (Val Loss: %.6f, Val MAE: %.4f) ***' % (
+                best_val_loss, best_val_mae))
+        
+        print('')
+    
+    print('Training completed!')
+    print('Best model: Epoch %d, Val Loss: %.6f, Val MAE: %.4f' % (
+        best_epoch, best_val_loss, best_val_mae))
