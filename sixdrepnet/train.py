@@ -214,8 +214,8 @@ if __name__ == '__main__':
     gpu = args.gpu_id
     b_scheduler = args.scheduler
 
-    if not os.path.exists('output/snapshots'):
-        os.makedirs('output/snapshots')
+    if not os.path.exists('../../../output/snapshots'):
+        os.makedirs('../../../output/snapshots')
 
     # summary_name = '{}_{}_bs{}'.format(
     #     'SixDRepNet', int(time.time()), args.batch_size)
@@ -223,8 +223,8 @@ if __name__ == '__main__':
     summary_name = '{}_{}_bs{}'.format(
         'SixDRepNet', current_time, args.batch_size)
 
-    if not os.path.exists('output/snapshots/{}'.format(summary_name)):
-        os.makedirs('output/snapshots/{}'.format(summary_name))
+    if not os.path.exists('../../../output/snapshots/{}'.format(summary_name)):
+        os.makedirs('../../../output/snapshots/{}'.format(summary_name))
 
     # 创建模型
     if args.backbone == 'MobileNetV2':
@@ -332,7 +332,7 @@ if __name__ == '__main__':
             model=model,
             sample_input=sample_images,
             backbone_name=backbone_name,
-            output_dir='output/snapshots/{}'.format(summary_name),
+            output_dir='../../../output/snapshots/{}'.format(summary_name),
             device=f'cuda:{gpu}' if gpu >= 0 else 'cpu'
         )
     except Exception as e:
@@ -467,7 +467,7 @@ if __name__ == '__main__':
             print('    - Consider checking data distribution and model architecture')
         
         # 保存训练历史（每个epoch都保存）
-        history_path = 'output/snapshots/{}/training_history.json'.format(summary_name)
+        history_path = '../../../output/snapshots/{}/training_history.json'.format(summary_name)
         with open(history_path, 'w') as f:
             json.dump(training_history, f, indent=2)
         
@@ -505,13 +505,14 @@ if __name__ == '__main__':
             'training_history': training_history
         }
         
-        checkpoint_path = 'output/snapshots/{}/{}checkpoint_epoch_{}.tar'.format(
+        checkpoint_path = '../../../output/snapshots/{}/{}checkpoint_epoch_{}.tar'.format(
             summary_name, args.output_string + '_' if args.output_string else '', epoch + 1)
-        torch.save(checkpoint, checkpoint_path)
+        # 不进行每一步epoch的保存
+        # torch.save(checkpoint, checkpoint_path)
         
         # 保存最佳模型
         if is_best:
-            best_model_path = 'output/snapshots/{}/{}best_model.tar'.format(
+            best_model_path = '../../../output/snapshots/{}/{}best_model.tar'.format(
                 summary_name, args.output_string + '_' if args.output_string else '')
             torch.save(checkpoint, best_model_path)
             print('  *** New best model saved! (Val Loss: %.6f, Val MAE: %.4f) ***' % (
