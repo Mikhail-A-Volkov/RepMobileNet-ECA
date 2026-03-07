@@ -23,21 +23,34 @@ from model import SixDRepNet, SixDRepNet_MobileNetV2
 import utils
 import datasets
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    value = str(v).strip().lower()
+    if value in ('yes', 'true', 't', '1', 'y'):
+        return True
+    if value in ('no', 'false', 'f', '0', 'n'):
+        return False
+    raise argparse.ArgumentTypeError('Boolean value expected.')
+
 
 def parse_args():
     """Parse input arguments."""
     parser = argparse.ArgumentParser(
         description='Head pose estimation using the 6DRepNet.')
+    default_gpu = 0 if torch.cuda.is_available() else -1
     parser.add_argument('--gpu',
-                        dest='gpu_id', help='GPU device id to use [0]',
-                        default=0, type=int)
+                        dest='gpu_id', help=f'GPU device id to use (default: {default_gpu} if GPU available, else CPU)',
+                        default=default_gpu, type=int)
     parser.add_argument('--data_dir',
                         dest='data_dir', help='Directory path for data.',
-                        default='datasets/AFLW2000', type=str)
+                        default='../../../datasets/AFLW2000', type=str)
+                        # default='../../../datasets/BIWI', type=str)
     parser.add_argument('--filename_list',
                         dest='filename_list',
                         help='Path to text file containing relative paths for every example.',
-                        default='datasets/AFLW2000/files.txt', type=str)  # datasets/BIWI_noTrack.npz
+                        default='../../../datasets/AFLW2000/files.txt', type=str)  # datasets/BIWI_noTrack.npz
+                        # default='../../../datasets/BIWI/files.txt', type=str)
     parser.add_argument('--snapshot',
                         dest='snapshot', help='Name of model snapshot.',
                         default='', type=str)
@@ -46,7 +59,7 @@ def parse_args():
                         default=64, type=int)
     parser.add_argument('--show_viz',
                         dest='show_viz', help='Save images with pose cube.',
-                        default=False, type=bool)
+                        default=False, type=str2bool)
     parser.add_argument('--dataset',
                         dest='dataset', help='Dataset type.',
                         default='AFLW2000', type=str)
@@ -75,21 +88,26 @@ if __name__ == '__main__':
     cudnn.enabled = True
     gpu = args.gpu_id
     snapshot_path = args.snapshot
+    use_gpu = (gpu >= 0 and torch.cuda.is_available())
+    device = torch.device(f'cuda:{gpu}' if use_gpu else 'cpu')
     
     # 根据backbone类型创建模型
-    if args.backbone == 'MobileNetV2':
+    backbone_name = str(args.backbone).strip().lower()
+    if backbone_name in ('mobilenetv2', 'mobilenet_v2', 'mobilenet'):
         model = SixDRepNet_MobileNetV2(pretrained=False)
         print('Using MobileNetV2 backbone')
-    else:
+    elif backbone_name in ('repvgg', 'repvgg-b1g2'):
         model = SixDRepNet(backbone_name='RepVGG-B1g2',
                           backbone_file='',
                           deploy=True,
                           pretrained=False)
         print('Using RepVGG-B1g2 backbone')
+    else:
+        raise ValueError(f'Unsupported backbone: {args.backbone}. Use MobileNetV2/MobileNet_V2 or RepVGG.')
 
     print('Loading data.')
 
-    if args.backbone == 'MobileNetV2':
+    if backbone_name in ('mobilenetv2', 'mobilenet_v2', 'mobilenet'):
         transformations = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
@@ -114,13 +132,13 @@ if __name__ == '__main__':
 
 
     # Load snapshot
-    saved_state_dict = torch.load(snapshot_path, map_location='cpu')
+    saved_state_dict = torch.load(snapshot_path, map_location=device)
 
     if 'model_state_dict' in saved_state_dict:
         model.load_state_dict(saved_state_dict['model_state_dict'])
     else:
         model.load_state_dict(saved_state_dict)    
-    model.cuda(gpu)
+    model = model.to(device)
 
     # Test the Model
     model.eval()  # Change model to 'eval' mode (BN uses moving mean/var).
@@ -132,7 +150,7 @@ if __name__ == '__main__':
     with torch.no_grad():
 
         for i, (images, r_label, cont_labels, name) in enumerate(test_loader):
-            images = torch.Tensor(images).cuda(gpu)
+            images = torch.Tensor(images).to(device)
             total += cont_labels.size(0)
 
             # gt matrix
