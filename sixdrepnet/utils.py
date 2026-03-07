@@ -211,3 +211,25 @@ def get_R(x,y,z):
 
     R = Rz.dot(Ry.dot(Rx))
     return R
+
+
+class AddCoordChannels(object):
+    """
+    预处理阶段加入CoordConv的两个坐标通道（x,y），输出5通道输入。
+    输入: Tensor [3, H, W]
+    输出: Tensor [5, H, W]
+    """
+    def __call__(self, img_tensor):
+        if not isinstance(img_tensor, torch.Tensor):
+            raise TypeError("AddCoordChannels expects torch.Tensor input")
+        if img_tensor.dim() != 3 or img_tensor.size(0) != 3:
+            raise ValueError("AddCoordChannels expects input shape [3, H, W]")
+
+        _, h, w = img_tensor.shape
+        x_coords = torch.linspace(-1.0, 1.0, steps=w, dtype=img_tensor.dtype, device=img_tensor.device)
+        y_coords = torch.linspace(-1.0, 1.0, steps=h, dtype=img_tensor.dtype, device=img_tensor.device)
+        xx = x_coords.unsqueeze(0).expand(h, w)
+        yy = y_coords.unsqueeze(1).expand(h, w)
+        xx = xx.unsqueeze(0)
+        yy = yy.unsqueeze(0)
+        return torch.cat([img_tensor, xx, yy], dim=0)

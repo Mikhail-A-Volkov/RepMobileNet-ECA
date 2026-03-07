@@ -28,19 +28,21 @@ from loss import GeodesicLoss
 import utils
 import json
 from model_profiler import profile_model
-from model_profiler import profile_model
 
 def parse_args():
     """Parse input arguments."""
     parser = argparse.ArgumentParser(
         description='Head pose estimation using the 6DRepNet.')
+    # 检查是否有GPU可用，如果有则默认使用GPU 0
+    default_gpu = 0 if torch.cuda.is_available() else -1
     parser.add_argument(
-        '--gpu', dest='gpu_id', help='GPU device id to use [0]',
-        default=0, type=int)
+        '--gpu', dest='gpu_id', 
+        help=f'GPU device id to use (default: {default_gpu} if GPU available, else CPU)',
+        default=default_gpu, type=int)
     parser.add_argument(
         '--num_epochs', dest='num_epochs',
         help='Maximum number of training epochs.',
-        default=80, type=int)
+        default=100, type=int)
     parser.add_argument(
         '--batch_size', dest='batch_size', help='Batch size.',
         default=80, type=int)
@@ -72,7 +74,7 @@ def parse_args():
         default='', type=str)
     parser.add_argument(
         '--backbone', dest='backbone', help='Backbone type: RepVGG or MobileNetV2',
-        default='RepVGG', type=str)
+        default='MobileNetV2', type=str)
     parser.add_argument(
         '--val_split', dest='val_split', 
         help='Validation split ratio from training set (e.g., 0.1 for 10%%)',
@@ -104,6 +106,17 @@ def load_filtered_state_dict(model, snapshot):
     model.load_state_dict(model_dict)
 
 
+def output_to_rotation_matrix(model_output):
+    """
+    兼容两种输出:
+    - [B, 3, 3]: 已是旋转矩阵
+    - [B, 6]: 6D表示，转换为旋转矩阵
+    """
+    if isinstance(model_output, torch.Tensor) and model_output.dim() == 2 and model_output.size(1) == 6:
+        return utils.compute_rotation_matrix_from_ortho6d(model_output)
+    return model_output
+
+
 def validate(model, val_loader, criterion, gpu):
     """在验证集上评估模型"""
     model.eval()
@@ -114,11 +127,16 @@ def validate(model, val_loader, criterion, gpu):
     
     with torch.no_grad():
         for images, r_label, cont_labels, _ in val_loader:
-            images = images.cuda(gpu)
-            R_gt = r_label.cuda(gpu)
+            if gpu >= 0:
+                images = images.cuda(gpu)
+                R_gt = r_label.cuda(gpu)
+            else:
+                images = images
+                R_gt = r_label
             
-            # 预测
-            R_pred = model(images)
+            # 预测（模型可输出6D或旋转矩阵）
+            pred_out = model(images)
+            R_pred = output_to_rotation_matrix(pred_out)
             
             # 计算损失
             loss = criterion(R_gt, R_pred)
@@ -212,6 +230,20 @@ if __name__ == '__main__':
     num_epochs = args.num_epochs
     batch_size = args.batch_size
     gpu = args.gpu_id
+    
+    # 显式检查GPU可用性
+    if gpu >= 0:
+        if not torch.cuda.is_available():
+            print(f'Warning: GPU {gpu} requested but CUDA is not available. Using CPU instead.')
+            gpu = -1
+        elif gpu >= torch.cuda.device_count():
+            print(f'Warning: GPU {gpu} requested but only {torch.cuda.device_count()} GPU(s) available. Using GPU 0 instead.')
+            gpu = 0
+        else:
+            print(f'Using GPU {gpu}')
+    else:
+        print('Using CPU')
+    
     b_scheduler = args.scheduler
 
     if not os.path.exists('../../../output/snapshots'):
@@ -228,9 +260,7 @@ if __name__ == '__main__':
 
     # 创建模型
     if args.backbone == 'MobileNetV2':
-        model = SixDRepNet_MobileNetV2(
-            backbone_file='../../../weights/RepVGG/mobilenet_v2-b0353104.pth',
-            pretrained=True)
+        model = SixDRepNet_MobileNetV2(pretrained=True)
         backbone_name = 'MobileNetV2'
     else:
         model = SixDRepNet(backbone_name='RepVGG-B1g2',
@@ -248,26 +278,44 @@ if __name__ == '__main__':
 
     print('Loading data.')
 
-    normalize = transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225])
-
-    transformations = transforms.Compose([transforms.RandomResizedCrop(size=224,scale=(0.8,1)),
-                                          transforms.ToTensor(),
-                                          normalize])
+    if args.backbone == 'MobileNetV2':
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406, 0.0, 0.0],
+            std=[0.229, 0.224, 0.225, 1.0, 1.0])
+        transformations = transforms.Compose([
+            transforms.RandomResizedCrop(size=224, scale=(0.8, 1)),
+            transforms.ToTensor(),
+            utils.AddCoordChannels(),
+            normalize
+        ])
+        val_transformations = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            utils.AddCoordChannels(),
+            normalize
+        ])
+    else:
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225])
+        transformations = transforms.Compose([
+            transforms.RandomResizedCrop(size=224, scale=(0.8, 1)),
+            transforms.ToTensor(),
+            normalize
+        ])
+        val_transformations = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            normalize
+        ])
 
     # 加载完整训练集
     full_dataset = datasets.getDataset(
         args.dataset, args.data_dir, args.filename_list, transformations)
 
     # 准备验证集：从训练集中划分或使用独立数据集
-    val_transformations = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        normalize
-    ])
-    
     if args.val_dataset is not None:
         # 使用独立的验证数据集（不推荐，但保留此选项）
         print(f'Using separate validation dataset: {args.val_dataset}')
@@ -312,7 +360,10 @@ if __name__ == '__main__':
         shuffle=False,
         num_workers=2)
 
-    model.cuda(gpu)
+    if gpu >= 0:
+        model.cuda(gpu)
+    else:
+        model.cpu()
     
     # 模型分析：在训练开始前分析模型结构（仅执行一次）
     print('='*70)
@@ -323,9 +374,13 @@ if __name__ == '__main__':
         sample_batch = next(iter(train_loader))
         sample_images = sample_batch[0]  # 获取images
         if isinstance(sample_images, torch.Tensor):
-            sample_images = sample_images[:1].cuda(gpu)  # 只取第一个样本，减少计算
+            sample_images = sample_images[:1]  # 只取第一个样本，减少计算
+            if gpu >= 0:
+                sample_images = sample_images.cuda(gpu)
         else:
-            sample_images = sample_images[0:1].cuda(gpu) if len(sample_images) > 0 else sample_images.cuda(gpu)
+            sample_images = sample_images[0:1] if len(sample_images) > 0 else sample_images
+            if gpu >= 0 and isinstance(sample_images, torch.Tensor):
+                sample_images = sample_images.cuda(gpu)
         
         # 执行模型分析
         profile_model(
@@ -343,7 +398,10 @@ if __name__ == '__main__':
     print('='*70)
     print('')
     
-    crit = GeodesicLoss().cuda(gpu) #torch.nn.MSELoss().cuda(gpu)
+    if gpu >= 0:
+        crit = GeodesicLoss().cuda(gpu) #torch.nn.MSELoss().cuda(gpu)
+    else:
+        crit = GeodesicLoss()  # CPU模式
     optimizer = torch.optim.Adam(model.parameters(), args.lr)
 
 
@@ -393,13 +451,17 @@ if __name__ == '__main__':
         
         for i, (images, gt_mat, _, _) in enumerate(train_loader):
             iter += 1
-            images = torch.Tensor(images).cuda(gpu)
+            images = torch.Tensor(images)
+            if gpu >= 0:
+                images = images.cuda(gpu)
+                gt_mat = gt_mat.cuda(gpu)
 
-            # Forward pass
-            pred_mat = model(images)
+            # Forward pass（模型可输出6D或旋转矩阵）
+            pred_out = model(images)
+            pred_mat = output_to_rotation_matrix(pred_out)
 
             # Calc loss
-            loss = crit(gt_mat.cuda(gpu), pred_mat)
+            loss = crit(gt_mat, pred_mat)
 
             optimizer.zero_grad()
             loss.backward()

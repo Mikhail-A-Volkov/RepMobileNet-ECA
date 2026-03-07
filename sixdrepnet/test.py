@@ -52,7 +52,7 @@ def parse_args():
                         default='AFLW2000', type=str)
     parser.add_argument('--backbone',
                         dest='backbone', help='Backbone type: RepVGG or MobileNetV2',
-                        default='RepVGG', type=str)
+                        default='MobileNetV2', type=str)
 
     args = parser.parse_args()
     return args
@@ -64,6 +64,12 @@ def load_filtered_state_dict(model, snapshot):
     model_dict.update(snapshot)
     model.load_state_dict(model_dict)
 
+
+def output_to_rotation_matrix(model_output):
+    if isinstance(model_output, torch.Tensor) and model_output.dim() == 2 and model_output.size(1) == 6:
+        return utils.compute_rotation_matrix_from_ortho6d(model_output)
+    return model_output
+
 if __name__ == '__main__':
     args = parse_args()
     cudnn.enabled = True
@@ -72,9 +78,7 @@ if __name__ == '__main__':
     
     # 根据backbone类型创建模型
     if args.backbone == 'MobileNetV2':
-        model = SixDRepNet_MobileNetV2(
-            backbone_file='../../../weights/RepVGG/mobilenet_v2-b0353104.pth',
-            pretrained=False)
+        model = SixDRepNet_MobileNetV2(pretrained=False)
         print('Using MobileNetV2 backbone')
     else:
         model = SixDRepNet(backbone_name='RepVGG-B1g2',
@@ -85,10 +89,21 @@ if __name__ == '__main__':
 
     print('Loading data.')
 
-    transformations = transforms.Compose([transforms.Resize(256),
-                                          transforms.CenterCrop(
-                                              224), transforms.ToTensor(),
-                                          transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+    if args.backbone == 'MobileNetV2':
+        transformations = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            utils.AddCoordChannels(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406, 0.0, 0.0], std=[0.229, 0.224, 0.225, 1.0, 1.0])
+        ])
+    else:
+        transformations = transforms.Compose([
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
     pose_dataset = datasets.getDataset(
         args.dataset, args.data_dir, args.filename_list, transformations, train_mode = False)
@@ -128,7 +143,8 @@ if __name__ == '__main__':
             p_gt_deg = cont_labels[:, 1].float()*180/np.pi
             r_gt_deg = cont_labels[:, 2].float()*180/np.pi
 
-            R_pred = model(images)
+            pred_out = model(images)
+            R_pred = output_to_rotation_matrix(pred_out)
 
             euler = utils.compute_euler_angles_from_rotation_matrices(
                 R_pred)*180/np.pi

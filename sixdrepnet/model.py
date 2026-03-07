@@ -2,9 +2,9 @@ import math
 
 import torch
 from torch import nn
+from torchvision.models import mobilenet_v2
 
 from backbone.repvgg import get_RepVGG_func_by_name
-from backbone.mobilenet_v2 import mobilenet_v2
 import utils
 
 class SixDRepNet(nn.Module):
@@ -115,68 +115,162 @@ class SixDRepNet2(nn.Module):
 
 class SixDRepNet_MobileNetV2(nn.Module):
     """
-    使用MobileNetV2作为backbone的6DRepNet模型
+    使用改造后的MobileNetV2作为backbone的6DRepNet模型
+    - CoordConv(3->5)在预处理完成，本模型输入为5通道
+    - stage3/stage5后接scSE与LMFA
+    - Head: RepConv x2 -> GAP -> FC -> 6D
+    - forward返回6D向量，旋转矩阵转换放到训练/测试后处理
     """
-    def __init__(self, backbone_file='../../../weights/RepVGG/mobilenet_v2-b0353104.pth', pretrained=True):
+    def __init__(self, pretrained=True, use_stage7_scse=False):
         super(SixDRepNet_MobileNetV2, self).__init__()
-        
-        # 创建MobileNetV2 backbone（手动实现）
-        mobilenet = mobilenet_v2(pretrained=False)
-        
-        # 加载预训练权重
-        if pretrained and backbone_file:
-            try:
-                checkpoint = torch.load(backbone_file, map_location='cpu')
-                # 处理不同的权重文件格式
-                if 'state_dict' in checkpoint:
-                    state_dict = checkpoint['state_dict']
-                elif isinstance(checkpoint, dict) and 'model' in checkpoint:
-                    state_dict = checkpoint['model']
-                else:
-                    state_dict = checkpoint
-                
-                # 移除可能的module.前缀
-                state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-                
-                # 只加载features部分的权重（去掉classifier部分）
-                features_dict = {}
-                for k, v in state_dict.items():
-                    if k.startswith('features.'):
-                        features_dict[k] = v
-                    elif not k.startswith('classifier.'):
-                        # 如果没有features前缀，直接使用
-                        features_dict[k] = v
-                
-                mobilenet.features.load_state_dict(features_dict, strict=False)
-                print(f'Loaded pretrained weights from {backbone_file}')
-            except Exception as e:
-                print(f'Warning: Failed to load pretrained weights from {backbone_file}: {e}')
-                print('Training from scratch...')
-        
-        # 只使用特征提取部分
-        self.features = mobilenet.features
-        
-        # 获取最后一层的输出通道数（MobileNetV2通常是1280）
-        self.last_channel = mobilenet.last_channel
-        
-        # 全局平均池化
+        mobilenet = mobilenet_v2(pretrained=pretrained)
+
+        # Stem: Conv3x3(5->32,s=2) + BN + ReLU6
+        self.stem_conv = nn.Conv2d(5, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        self.stem_bn = nn.BatchNorm2d(32)
+        self.stem_relu = nn.ReLU6(inplace=True)
+
+        # 初始化stem（前三通道拷贝预训练，后两通道置零）
+        if pretrained:
+            with torch.no_grad():
+                pre_conv = mobilenet.features[0][0].weight
+                self.stem_conv.weight.zero_()
+                self.stem_conv.weight[:, :3, :, :] = pre_conv
+                self.stem_bn.weight.copy_(mobilenet.features[0][1].weight)
+                self.stem_bn.bias.copy_(mobilenet.features[0][1].bias)
+                self.stem_bn.running_mean.copy_(mobilenet.features[0][1].running_mean)
+                self.stem_bn.running_var.copy_(mobilenet.features[0][1].running_var)
+
+        # stage1~stage7（原样）
+        self.stage1 = mobilenet.features[1]    # 16
+        self.stage2_1 = mobilenet.features[2]  # 24
+        self.stage2_2 = mobilenet.features[3]
+        self.stage3_1 = mobilenet.features[4]  # 32
+        self.stage3_2 = mobilenet.features[5]
+        self.stage3_3 = mobilenet.features[6]
+        self.stage4_1 = mobilenet.features[7]  # 64
+        self.stage4_2 = mobilenet.features[8]
+        self.stage4_3 = mobilenet.features[9]
+        self.stage4_4 = mobilenet.features[10]
+        self.stage5_1 = mobilenet.features[11]  # 96
+        self.stage5_2 = mobilenet.features[12]
+        self.stage5_3 = mobilenet.features[13]
+        self.stage6_1 = mobilenet.features[14]  # 160
+        self.stage6_2 = mobilenet.features[15]
+        self.stage6_3 = mobilenet.features[16]
+        self.stage7 = mobilenet.features[17]    # 320
+
+        # scSE + LMFA
+        self.stage3_scse = SCSEBlock(32)
+        self.stage3_lmfa = LMFABlock(32)
+        self.stage5_scse = SCSEBlock(96)
+        self.stage5_lmfa = LMFABlock(96)
+        self.use_stage7_scse = use_stage7_scse
+        self.stage7_scse = SCSEBlock(320)
+
+        # Head: RepConv x2 -> GAP -> FC -> 6D
+        self.repconv1 = RepConvBlock(320, 320)
+        self.repconv2 = RepConvBlock(320, 320)
         self.gap = nn.AdaptiveAvgPool2d(output_size=1)
-        
-        # 6D表示的回归层
-        self.linear_reg = nn.Linear(self.last_channel, 6)
+        self.linear_reg = nn.Linear(320, 6)
     
     def forward(self, x):
-        # 特征提取
-        x = self.features(x)  # [B, 1280, H/32, W/32]
-        
-        # 全局平均池化
-        x = self.gap(x)  # [B, 1280, 1, 1]
-        
-        # 展平
-        x = torch.flatten(x, 1)  # [B, 1280]
-        
-        # 6D表示回归
-        x = self.linear_reg(x)  # [B, 6]
-        
-        # 转换为旋转矩阵
-        return utils.compute_rotation_matrix_from_ortho6d(x)
+        # stem
+        x = self.stem_conv(x)
+        x = self.stem_bn(x)
+        x = self.stem_relu(x)
+
+        # stage1/2/3
+        x = self.stage1(x)
+        x = self.stage2_1(x)
+        x = self.stage2_2(x)
+        x = self.stage3_1(x)
+        x = self.stage3_2(x)
+        x = self.stage3_3(x)
+        x = self.stage3_scse(x)
+        x = self.stage3_lmfa(x)
+
+        # stage4/5
+        x = self.stage4_1(x)
+        x = self.stage4_2(x)
+        x = self.stage4_3(x)
+        x = self.stage4_4(x)
+        x = self.stage5_1(x)
+        x = self.stage5_2(x)
+        x = self.stage5_3(x)
+        x = self.stage5_scse(x)
+        x = self.stage5_lmfa(x)
+
+        # stage6/7
+        x = self.stage6_1(x)
+        x = self.stage6_2(x)
+        x = self.stage6_3(x)
+        x = self.stage7(x)
+        if self.use_stage7_scse:
+            x = self.stage7_scse(x)
+
+        # head
+        x = self.repconv1(x)
+        x = self.repconv2(x)
+        x = self.gap(x)
+        x = torch.flatten(x, 1)
+        x = self.linear_reg(x)
+        return x
+
+
+class RepConvBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(RepConvBlock, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.act = nn.ReLU6(inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
+
+
+class SCSEBlock(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super(SCSEBlock, self).__init__()
+        reduced = max(channels // reduction, 1)
+        self.cse_pool = nn.AdaptiveAvgPool2d(1)
+        self.cse_fc1 = nn.Conv2d(channels, reduced, kernel_size=1, bias=True)
+        self.cse_relu = nn.ReLU(inplace=True)
+        self.cse_fc2 = nn.Conv2d(reduced, channels, kernel_size=1, bias=True)
+        self.cse_hs = nn.Hardsigmoid(inplace=True)
+        self.sse_conv = nn.Conv2d(channels, 1, kernel_size=1, bias=True)
+        self.sse_hs = nn.Hardsigmoid(inplace=True)
+
+    def forward(self, x):
+        c = self.cse_pool(x)
+        c = self.cse_fc1(c)
+        c = self.cse_relu(c)
+        c = self.cse_fc2(c)
+        c = self.cse_hs(c)
+        s = self.sse_conv(x)
+        s = self.sse_hs(s)
+        return x * c + x * s
+
+
+class LMFABlock(nn.Module):
+    def __init__(self, channels):
+        super(LMFABlock, self).__init__()
+        self.b1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1,
+                            groups=channels, bias=False)
+        self.b2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=2,
+                            dilation=2, groups=channels, bias=False)
+        self.b3 = nn.Conv2d(channels, channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.fuse = nn.Conv2d(channels * 3, channels, kernel_size=1, stride=1, padding=0, bias=True)
+        self.hsig = nn.Hardsigmoid(inplace=True)
+
+    def forward(self, x):
+        z1 = self.b1(x)
+        z2 = self.b2(x)
+        z3 = self.b3(x)
+        z = torch.cat([z1, z2, z3], dim=1)
+        z = self.fuse(z)
+        z = self.hsig(z)
+        return x + z
