@@ -121,12 +121,16 @@ class SixDRepNet_MobileNetV2(nn.Module):
     - Head: RepConv x2 -> GAP -> FC -> 6D
     - forward返回6D向量，旋转矩阵转换放到训练/测试后处理
     """
-    def __init__(self, pretrained=True, use_stage7_scse=False):
+    def __init__(self, pretrained=True, use_stage7_scse=False, use_CoordConv=False):
         super(SixDRepNet_MobileNetV2, self).__init__()
         mobilenet = mobilenet_v2(pretrained=pretrained)
 
         # Stem: Conv3x3(5->32,s=2) + BN + ReLU6
-        self.stem_conv = nn.Conv2d(5, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        if use_CoordConv:
+            self.stem_conv = nn.Conv2d(5, 32, kernel_size=3, stride=2, padding=1, bias=False)
+        else:
+            self.stem_conv = nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False)
+            
         self.stem_bn = nn.BatchNorm2d(32)
         self.stem_relu = nn.ReLU6(inplace=True)
 

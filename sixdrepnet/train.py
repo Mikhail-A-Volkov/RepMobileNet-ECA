@@ -258,9 +258,11 @@ if __name__ == '__main__':
     if not os.path.exists('../../../output/snapshots/{}'.format(summary_name)):
         os.makedirs('../../../output/snapshots/{}'.format(summary_name))
 
+    use_CoordConv = False
+
     # 创建模型
     if args.backbone == 'MobileNetV2':
-        model = SixDRepNet_MobileNetV2(pretrained=True)
+        model = SixDRepNet_MobileNetV2(pretrained=True, use_CoordConv=use_CoordConv)
         backbone_name = 'MobileNetV2'
     else:
         model = SixDRepNet(backbone_name='RepVGG-B1g2',
@@ -277,8 +279,6 @@ if __name__ == '__main__':
             model.load_state_dict(saved_state_dict)
 
     print('Loading data.')
-    
-    use_CoordConv = False
 
     if args.backbone == 'MobileNetV2' and use_CoordConv:
         normalize = transforms.Normalize(
