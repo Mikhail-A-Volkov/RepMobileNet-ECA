@@ -277,8 +277,10 @@ if __name__ == '__main__':
             model.load_state_dict(saved_state_dict)
 
     print('Loading data.')
+    
+    use_CoordConv = False
 
-    if args.backbone == 'MobileNetV2':
+    if args.backbone == 'MobileNetV2' and use_CoordConv:
         normalize = transforms.Normalize(
             mean=[0.485, 0.456, 0.406, 0.0, 0.0],
             std=[0.229, 0.224, 0.225, 1.0, 1.0])
