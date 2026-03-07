@@ -411,7 +411,7 @@ if __name__ == '__main__':
         if args.scheduler_type == 'ReduceLROnPlateau':
             # 基于验证损失的动态学习率调整
             scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer, mode='min', factor=0.5, patience=5, verbose=True, min_lr=1e-6)
+                optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6)
             print('Using ReduceLROnPlateau scheduler (based on validation loss)')
         else:
             # MultiStepLR - 在多个epoch降低学习率
