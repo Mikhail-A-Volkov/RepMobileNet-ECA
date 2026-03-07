@@ -49,10 +49,10 @@ def parse_args():
     parser.add_argument(
         '--lr', dest='lr', help='Base learning rate.',
         default=0.0001, type=float)
-    parser.add_argument('--scheduler', default=False, type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--scheduler', default=True, type=lambda x: (str(x).lower() == 'true'))
     parser.add_argument('--scheduler_type', dest='scheduler_type', 
                        help='Scheduler type: MultiStepLR or ReduceLROnPlateau',
-                       default='MultiStepLR', type=str)
+                       default='ReduceLROnPlateau', type=str)
     parser.add_argument('--grad_clip', dest='grad_clip', 
                        help='Gradient clipping value (0 to disable)',
                        default=0.0, type=float)
