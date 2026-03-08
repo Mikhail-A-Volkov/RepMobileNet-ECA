@@ -221,8 +221,8 @@ class SixDRepNet_MobileNetV2(nn.Module):
             x = self.stage7_scse(x)
 
         # head
-        # x = self.repconv1(x)
-        # x = self.repconv2(x)
+        x = self.repconv1(x)
+        x = self.repconv2(x)
         x = self.gap(x)
         x = torch.flatten(x, 1)
         x = self.linear_reg(x)
