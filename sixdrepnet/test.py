@@ -18,7 +18,6 @@ import matplotlib
 from matplotlib import pyplot as plt
 from PIL import Image
 
-from sixdrepnet.train import use_CoordConv
 matplotlib.use('TkAgg')
 
 from model import SixDRepNet, SixDRepNet_MobileNetV2
