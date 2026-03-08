@@ -258,7 +258,7 @@ if __name__ == '__main__':
     if not os.path.exists('../../../output/snapshots/{}'.format(summary_name)):
         os.makedirs('../../../output/snapshots/{}'.format(summary_name))
 
-    use_CoordConv = False
+    use_CoordConv = True
 
     # 创建模型
     if args.backbone == 'MobileNetV2':
