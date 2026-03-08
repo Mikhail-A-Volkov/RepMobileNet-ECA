@@ -29,6 +29,11 @@ import utils
 import json
 from model_profiler import profile_model
 
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    return str(v).lower() in ('true', '1', 'yes', 'y', 't')
+
 def parse_args():
     """Parse input arguments."""
     parser = argparse.ArgumentParser(
@@ -49,7 +54,7 @@ def parse_args():
     parser.add_argument(
         '--lr', dest='lr', help='Base learning rate.',
         default=0.0001, type=float)
-    parser.add_argument('--scheduler', default=True, type=lambda x: (str(x).lower() == 'true'))
+    parser.add_argument('--scheduler', default=True, type=str2bool)
     parser.add_argument('--scheduler_type', dest='scheduler_type', 
                        help='Scheduler type: MultiStepLR or ReduceLROnPlateau',
                        default='ReduceLROnPlateau', type=str)
@@ -94,6 +99,26 @@ def parse_args():
         '--val_seed', dest='val_seed', 
         help='Random seed for train/val split',
         default=42, type=int)
+    parser.add_argument(
+        '--optimizer_mode', dest='optimizer_mode',
+        help='Optimizer mode: original (Adam) or improved (AdamW)',
+        default='original', type=str)
+    parser.add_argument(
+        '--weight_decay', dest='weight_decay',
+        help='Weight decay for improved optimizer (AdamW)',
+        default=1e-4, type=float)
+    parser.add_argument(
+        '--use_distillation', dest='use_distillation',
+        help='Enable knowledge distillation from RepVGG teacher',
+        default=False, type=str2bool)
+    parser.add_argument(
+        '--distill_alpha', dest='distill_alpha',
+        help='Loss weight for distillation term. total=(1-alpha)*gt + alpha*distill',
+        default=0.3, type=float)
+    parser.add_argument(
+        '--teacher_snapshot', dest='teacher_snapshot',
+        help='Optional checkpoint path for teacher model. If empty, use RepVGG pretrained backbone weights.',
+        default='../../../output/best_epoch_for_6DRepNet.tar', type=str)
 
     args = parser.parse_args()
     return args
@@ -404,7 +429,50 @@ if __name__ == '__main__':
         crit = GeodesicLoss().cuda(gpu) #torch.nn.MSELoss().cuda(gpu)
     else:
         crit = GeodesicLoss()  # CPU模式
-    optimizer = torch.optim.Adam(model.parameters(), args.lr)
+    kd_criterion = GeodesicLoss().cuda(gpu) if gpu >= 0 else GeodesicLoss()
+    
+    # 知识蒸馏配置（默认关闭）
+    use_distillation = args.use_distillation
+    teacher_model = None
+    if use_distillation:
+        if args.backbone != 'MobileNetV2':
+            print('Warning: Distillation is only designed for MobileNetV2 student. Disabling distillation.')
+            use_distillation = False
+        elif not (0.0 <= args.distill_alpha <= 1.0):
+            print(f'Warning: distill_alpha={args.distill_alpha} is out of [0,1]. Clamping to valid range.')
+            args.distill_alpha = max(0.0, min(1.0, args.distill_alpha))
+        else:
+            teacher_model = SixDRepNet(
+                backbone_name='RepVGG-B1g2',
+                backbone_file='../../../weights/RepVGG/RepVGG-B1g2-train.pth',
+                deploy=False,
+                pretrained=True
+            )
+            if args.teacher_snapshot != '':
+                print(f'Loading teacher snapshot: {args.teacher_snapshot}')
+                teacher_ckpt = torch.load(args.teacher_snapshot, map_location='cpu')
+                if 'model_state_dict' in teacher_ckpt:
+                    teacher_model.load_state_dict(teacher_ckpt['model_state_dict'])
+                else:
+                    teacher_model.load_state_dict(teacher_ckpt)
+            if gpu >= 0:
+                teacher_model = teacher_model.cuda(gpu)
+            else:
+                teacher_model = teacher_model.cpu()
+            teacher_model.eval()
+            for p in teacher_model.parameters():
+                p.requires_grad = False
+            print(f'Knowledge distillation enabled. Alpha={args.distill_alpha:.3f}')
+    
+    # 优化器开关（默认保持原始配置）
+    optimizer_mode = args.optimizer_mode.lower()
+    if optimizer_mode == 'improved':
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.999))
+        print(f'Using improved optimizer: AdamW (lr={args.lr}, weight_decay={args.weight_decay})')
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), args.lr)
+        print(f'Using original optimizer: Adam (lr={args.lr})')
 
 
     # 学习率调度器配置
@@ -431,6 +499,8 @@ if __name__ == '__main__':
     # 初始化训练历史记录
     training_history = {
         'train_loss': [],
+        'train_gt_loss': [],
+        'train_distill_loss': [],
         'val_loss': [],
         'val_mae': [],
         'val_yaw_error': [],
@@ -449,6 +519,8 @@ if __name__ == '__main__':
     for epoch in range(num_epochs):
         model.train()
         loss_sum = .0
+        gt_loss_sum = .0
+        distill_loss_sum = .0
         iter = 0
         
         for i, (images, gt_mat, _, _) in enumerate(train_loader):
@@ -462,8 +534,21 @@ if __name__ == '__main__':
             pred_out = model(images)
             pred_mat = output_to_rotation_matrix(pred_out)
 
-            # Calc loss
-            loss = crit(gt_mat, pred_mat)
+            # 监督损失
+            gt_loss = crit(gt_mat, pred_mat)
+            
+            # 蒸馏损失（teacher输出旋转矩阵）
+            distill_loss = torch.tensor(0.0, device=pred_mat.device)
+            if use_distillation and teacher_model is not None:
+                with torch.no_grad():
+                    # 若student输入为CoordConv 5通道，teacher仅使用RGB 3通道
+                    teacher_images = images[:, :3, :, :] if images.size(1) > 3 else images
+                    teacher_out = teacher_model(teacher_images)
+                    teacher_mat = output_to_rotation_matrix(teacher_out)
+                distill_loss = kd_criterion(teacher_mat, pred_mat)
+                loss = (1.0 - args.distill_alpha) * gt_loss + args.distill_alpha * distill_loss
+            else:
+                loss = gt_loss
 
             optimizer.zero_grad()
             loss.backward()
@@ -475,13 +560,23 @@ if __name__ == '__main__':
             optimizer.step()
 
             loss_sum += loss.item()
+            gt_loss_sum += gt_loss.item()
+            if use_distillation and teacher_model is not None:
+                distill_loss_sum += distill_loss.item()
 
             if (i+1) % 100 == 0:
-                print('Epoch [%d/%d], Iter [%d/%d] Loss: %.6f' % (
-                    epoch+1, num_epochs, i+1, len(train_dataset)//batch_size, loss.item()))
+                if use_distillation and teacher_model is not None:
+                    print('Epoch [%d/%d], Iter [%d/%d] Loss: %.6f (GT: %.6f, KD: %.6f)' % (
+                        epoch+1, num_epochs, i+1, len(train_dataset)//batch_size, loss.item(),
+                        gt_loss.item(), distill_loss.item()))
+                else:
+                    print('Epoch [%d/%d], Iter [%d/%d] Loss: %.6f' % (
+                        epoch+1, num_epochs, i+1, len(train_dataset)//batch_size, loss.item()))
         
         # 计算平均训练损失
         avg_train_loss = loss_sum / iter
+        avg_gt_loss = gt_loss_sum / iter
+        avg_distill_loss = distill_loss_sum / iter if (use_distillation and teacher_model is not None) else 0.0
         
         # 验证集评估
         print('Validating...')
@@ -506,6 +601,8 @@ if __name__ == '__main__':
         # 记录训练历史
         training_history['epoch'].append(epoch + 1)
         training_history['train_loss'].append(avg_train_loss)
+        training_history['train_gt_loss'].append(avg_gt_loss)
+        training_history['train_distill_loss'].append(avg_distill_loss)
         training_history['val_loss'].append(val_metrics['loss'])
         training_history['val_mae'].append(val_metrics['mae'])
         training_history['val_yaw_error'].append(val_metrics['yaw_error'])
@@ -516,6 +613,8 @@ if __name__ == '__main__':
         # 打印epoch总结
         print('Epoch [%d/%d] Summary:' % (epoch+1, num_epochs))
         print('  Train Loss: %.6f' % avg_train_loss)
+        if use_distillation and teacher_model is not None:
+            print('  Train GT Loss: %.6f, Train KD Loss: %.6f' % (avg_gt_loss, avg_distill_loss))
         print('  Val Loss: %.6f' % val_metrics['loss'])
         print('  Val MAE: %.4f (Yaw: %.4f, Pitch: %.4f, Roll: %.4f)' % (
             val_metrics['mae'], val_metrics['yaw_error'], 
@@ -562,6 +661,11 @@ if __name__ == '__main__':
             'batch_size': batch_size,
             'num_epochs': num_epochs,
             'backbone': backbone_name,
+            'optimizer_mode': optimizer_mode,
+            'weight_decay': args.weight_decay if optimizer_mode == 'improved' else 0.0,
+            'use_distillation': use_distillation,
+            'distill_alpha': args.distill_alpha if use_distillation else 0.0,
+            'teacher_snapshot': args.teacher_snapshot if use_distillation else '',
             'model_config': {
                 'backbone': backbone_name,
                 'deploy': False,

@@ -92,7 +92,7 @@ if __name__ == '__main__':
     use_gpu = (gpu >= 0 and torch.cuda.is_available())
     device = torch.device(f'cuda:{gpu}' if use_gpu else 'cpu')
     
-    use_CoordConv = False
+    use_CoordConv = True
     
     # 根据backbone类型创建模型
     backbone_name = str(args.backbone).strip().lower()
