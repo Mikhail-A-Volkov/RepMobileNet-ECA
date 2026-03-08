@@ -117,11 +117,12 @@ class SixDRepNet_MobileNetV2(nn.Module):
     """
     使用改造后的MobileNetV2作为backbone的6DRepNet模型
     - CoordConv(3->5)在预处理完成，本模型输入为5通道
-    - stage3/stage5后接scSE与LMFA
+    - stage3/stage5可二选一使用scSE或LMFA
+    - stage4/stage6后接scSE
     - Head: RepConv x2 -> GAP -> FC -> 6D
     - forward返回6D向量，旋转矩阵转换放到训练/测试后处理
     """
-    def __init__(self, pretrained=True, use_stage7_scse=False, use_CoordConv=False):
+    def __init__(self, pretrained=True, use_stage7_scse=True, use_CoordConv=False):
         super(SixDRepNet_MobileNetV2, self).__init__()
         mobilenet = mobilenet_v2(pretrained=pretrained)
 
@@ -164,11 +165,15 @@ class SixDRepNet_MobileNetV2(nn.Module):
         self.stage6_3 = mobilenet.features[16]
         self.stage7 = mobilenet.features[17]    # 320
 
-        # scSE + LMFA
-        self.stage3_scse = SCSEBlock(32)
+        # stage3/stage5: scSE 与 LMFA 二选一
+        self.stage3_alt_scse = SCSEBlock(32)
         self.stage3_lmfa = LMFABlock(32)
-        self.stage5_scse = SCSEBlock(96)
+        self.stage5_alt_scse = SCSEBlock(96)
         self.stage5_lmfa = LMFABlock(96)
+
+        # stage4/stage6: 固定使用 scSE
+        self.stage4_scse = SCSEBlock(64)
+        self.stage6_scse = SCSEBlock(160)
         self.use_stage7_scse = use_stage7_scse
         self.stage7_scse = SCSEBlock(320)
 
@@ -191,24 +196,26 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage3_1(x)
         x = self.stage3_2(x)
         x = self.stage3_3(x)
-        # x = self.stage3_scse(x)
-        # x = self.stage3_lmfa(x)
+        x = self.stage3_lmfa(x)
+        # x = self.stage3_alt_scse(x)
 
         # stage4/5
         x = self.stage4_1(x)
         x = self.stage4_2(x)
         x = self.stage4_3(x)
         x = self.stage4_4(x)
+        x = self.stage4_scse(x)
         x = self.stage5_1(x)
         x = self.stage5_2(x)
         x = self.stage5_3(x)
-        # x = self.stage5_scse(x)
-        # x = self.stage5_lmfa(x)
+        x = self.stage5_lmfa(x)
+        # x = self.stage5_alt_scse(x)
 
         # stage6/7
         x = self.stage6_1(x)
         x = self.stage6_2(x)
         x = self.stage6_3(x)
+        x = self.stage6_scse(x)
         x = self.stage7(x)
         if self.use_stage7_scse:
             x = self.stage7_scse(x)
@@ -267,6 +274,7 @@ class LMFABlock(nn.Module):
         self.b2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=2,
                             dilation=2, groups=channels, bias=False)
         self.b3 = nn.Conv2d(channels, channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.post_cat_scse = SCSEBlock(channels * 3)
         self.fuse = nn.Conv2d(channels * 3, channels, kernel_size=1, stride=1, padding=0, bias=True)
         self.hsig = nn.Hardsigmoid(inplace=True)
 
@@ -275,6 +283,7 @@ class LMFABlock(nn.Module):
         z2 = self.b2(x)
         z3 = self.b3(x)
         z = torch.cat([z1, z2, z3], dim=1)
+        z = self.post_cat_scse(z)
         z = self.fuse(z)
         z = self.hsig(z)
         return x + z
