@@ -222,7 +222,7 @@ class SixDRepNet_MobileNetV2(nn.Module):
 
         # head
         x = self.repconv1(x)
-        x = self.repconv2(x)
+        # x = self.repconv2(x)
         x = self.gap(x)
         x = torch.flatten(x, 1)
         x = self.linear_reg(x)
