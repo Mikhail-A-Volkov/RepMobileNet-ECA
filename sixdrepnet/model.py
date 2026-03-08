@@ -196,8 +196,8 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage3_1(x)
         x = self.stage3_2(x)
         x = self.stage3_3(x)
-        x = self.stage3_lmfa(x)
-        # x = self.stage3_alt_scse(x)
+        # x = self.stage3_lmfa(x)
+        x = self.stage3_alt_scse(x)
 
         # stage4/5
         x = self.stage4_1(x)
@@ -208,8 +208,8 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage5_1(x)
         x = self.stage5_2(x)
         x = self.stage5_3(x)
-        x = self.stage5_lmfa(x)
-        # x = self.stage5_alt_scse(x)
+        # x = self.stage5_lmfa(x)
+        x = self.stage5_alt_scse(x)
 
         # stage6/7
         x = self.stage6_1(x)
