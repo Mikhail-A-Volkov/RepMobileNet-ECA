@@ -17,6 +17,8 @@ from torchvision import transforms
 import matplotlib
 from matplotlib import pyplot as plt
 from PIL import Image
+
+from sixdrepnet.train import use_CoordConv
 matplotlib.use('TkAgg')
 
 from model import SixDRepNet, SixDRepNet_MobileNetV2
@@ -91,10 +93,12 @@ if __name__ == '__main__':
     use_gpu = (gpu >= 0 and torch.cuda.is_available())
     device = torch.device(f'cuda:{gpu}' if use_gpu else 'cpu')
     
+    use_CoordConv = False
+    
     # 根据backbone类型创建模型
     backbone_name = str(args.backbone).strip().lower()
     if backbone_name in ('mobilenetv2', 'mobilenet_v2', 'mobilenet'):
-        model = SixDRepNet_MobileNetV2(pretrained=False)
+        model = SixDRepNet_MobileNetV2(pretrained=False,use_CoordConv=use_CoordConv)
         print('Using MobileNetV2 backbone')
     elif backbone_name in ('repvgg', 'repvgg-b1g2'):
         model = SixDRepNet(backbone_name='RepVGG-B1g2',
@@ -107,7 +111,7 @@ if __name__ == '__main__':
 
     print('Loading data.')
 
-    if backbone_name in ('mobilenetv2', 'mobilenet_v2', 'mobilenet'):
+    if backbone_name in ('mobilenetv2', 'mobilenet_v2', 'mobilenet') and use_CoordConv:
         transformations = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
