@@ -1,4 +1,13 @@
-import torch
+"""
+DEPRECATED:
+This local MobileNetV2 implementation is kept only for backward compatibility.
+Current project default for SixDRepNet_MobileNetV2 uses torchvision's
+`mobilenet_v2` inside `sixdrepnet/model.py`.
+
+Please treat `sixdrepnet/model.py` as the single source of truth for the
+active MobileNetV2-based 6DRepNet architecture.
+"""
+
 import torch.nn as nn
 
 
