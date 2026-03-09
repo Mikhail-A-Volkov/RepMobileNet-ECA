@@ -212,7 +212,7 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage3_1(x)
         x = self.stage3_2(x)
         x = self.stage3_3(x)
-        x = self.stage3_lmfa(x)
+        # x = self.stage3_lmfa(x)
         # x = self.stage3_alt_scse(x)
         # x = self.stage3_alt_scse_eca(x)
 
@@ -226,7 +226,7 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage5_1(x)
         x = self.stage5_2(x)
         x = self.stage5_3(x)
-        x = self.stage5_lmfa(x)
+        # x = self.stage5_lmfa(x)
         # x = self.stage5_alt_scse(x)
         # x = self.stage5_alt_scse_eca(x)
 
@@ -237,6 +237,8 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage6_scse(x)
         # x = self.stage6_scse_eca(x)
         x = self.stage7(x)
+        
+        # stage7_scse优先不加这一层
         if self.use_stage7_scse:
             x = self.stage7_scse(x)
             # x = self.stage7_scse_eca(x)
@@ -482,7 +484,8 @@ class SCSEBlock(nn.Module):
 
 class ECAChannelGate(nn.Module):
     """
-    ECA channel gate: GAP -> local cross-channel interaction -> gate.
+    Standard ECA channel gate:
+    GAP -> Conv1d(k_size) along channel axis -> HardSigmoid.
     """
     def __init__(self, channels, k_size=3):
         super(ECAChannelGate, self).__init__()
@@ -492,10 +495,32 @@ class ECAChannelGate(nn.Module):
 
     def forward(self, x):
         y = self.avg_pool(x)  # [B, C, 1, 1]
-        y = y.squeeze(-1).transpose(-1, -2)  # [B, 1, C]
+        y = y.squeeze(-1).squeeze(-1).unsqueeze(1)  # [B, 1, C]
         y = self.conv1d(y)
         y = self.hsig(y)
-        y = y.transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
+        y = y.squeeze(1).unsqueeze(-1).unsqueeze(-1)  # [B, C, 1, 1]
+        return y
+
+class ECAChannelGate_VitisAI(nn.Module):
+    """
+    Vitis AI 2.5 Friendly ECA channel gate:
+    Uses Conv2d instead of Conv1d to prevent CPU fallback.
+    """
+    def __init__(self, channels, k_size=3):
+        super(ECAChannelGate_VitisAI, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # 将 Conv1d 替换为 Conv2d。
+        # 原 1D kernel size 为 k_size，现在替换为 2D kernel size (k_size, 1)
+        self.conv2d = nn.Conv2d(1, 1, kernel_size=(k_size, 1), padding=((k_size - 1) // 2, 0), bias=False)
+        self.hsig = nn.Hardsigmoid(inplace=True)
+
+    def forward(self, x):
+        y = self.avg_pool(x) 
+        y = y.transpose(1, 2)
+        y = self.conv2d(y)    # [B, 1, C, 1]
+        y = y.transpose(1, 2)
+        y = self.hsig(y)      # [B, C, 1, 1]
         return y
 
 
@@ -505,9 +530,10 @@ class SCSEECABlock(nn.Module):
     - cSE branch replaced with ECA channel gate
     - sSE branch unchanged
     """
-    def __init__(self, channels, eca_k_size=3):
+    def __init__(self, channels, k_size=3):
         super(SCSEECABlock, self).__init__()
-        self.eca_gate = ECAChannelGate(channels, k_size=eca_k_size)
+        # self.eca_gate = ECAChannelGate(channels, k_size=eca_k_size)
+        self.eca_gate = ECAChannelGate_VitisAI(channels, k_size=k_size)
         self.sse_conv = nn.Conv2d(channels, 1, kernel_size=1, bias=True)
         self.sse_hs = nn.Hardsigmoid(inplace=True)
 
@@ -532,7 +558,7 @@ class LMFABlock(nn.Module):
         self.fuse = nn.Conv2d(channels * 3, channels, kernel_size=1, stride=1, padding=0, bias=False)
         self.fuse_bn = nn.BatchNorm2d(channels)
         self.fuse_act = nn.ReLU6(inplace=True)
-        self.post_fuse_scse = SCSEECABlock(channels) # 使用scSE-ECA分支
+        self.post_fuse_scse = SCSEBlock(channels) # 考虑使用scSE-ECA分支
         self.hsig = nn.Hardsigmoid(inplace=True)
 
     def forward(self, x):
