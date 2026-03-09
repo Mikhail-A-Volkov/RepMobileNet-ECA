@@ -227,7 +227,7 @@ class SixDRepNet_MobileNetV2(nn.Module):
 
         # head
         x = self.repconv1(x)
-        # x = self.repconv2(x)
+        x = self.repconv2(x)
         # x = self.static_repconv1(x)
         # x = self.static_repconv2(x)
         x = self.gap(x)
