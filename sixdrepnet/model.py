@@ -120,10 +120,11 @@ class SixDRepNet_MobileNetV2(nn.Module):
     - CoordConv(3->5)在预处理完成，本模型输入为5通道
     - stage3/stage5可二选一使用scSE或LMFA
     - stage4/stage6后接scSE
+    - 支持注释切换为scSE-ECA分支（仅模型结构改动）
     - Head: RepConv x2 -> GAP -> FC -> 6D
     - forward返回6D向量，旋转矩阵转换放到训练/测试后处理
     """
-    def __init__(self, pretrained=True, use_stage7_scse=True, use_CoordConv=False, repconv_deploy=False):
+    def __init__(self, pretrained=True, use_stage7_scse=False, use_CoordConv=False, repconv_deploy=False):
         super(SixDRepNet_MobileNetV2, self).__init__()
         mobilenet = mobilenet_v2(pretrained=pretrained)
 
@@ -168,15 +169,20 @@ class SixDRepNet_MobileNetV2(nn.Module):
 
         # stage3/stage5: scSE 与 LMFA 二选一
         self.stage3_alt_scse = SCSEBlock(32)
+        self.stage3_alt_scse_eca = SCSEECABlock(32)
         self.stage3_lmfa = LMFABlock(32)
         self.stage5_alt_scse = SCSEBlock(96)
+        self.stage5_alt_scse_eca = SCSEECABlock(96)
         self.stage5_lmfa = LMFABlock(96)
 
         # stage4/stage6: 固定使用 scSE
         self.stage4_scse = SCSEBlock(64)
+        self.stage4_scse_eca = SCSEECABlock(64)
         self.stage6_scse = SCSEBlock(160)
+        self.stage6_scse_eca = SCSEECABlock(160)
         self.use_stage7_scse = use_stage7_scse
         self.stage7_scse = SCSEBlock(320)
+        self.stage7_scse_eca = SCSEECABlock(320)
 
         # Head: RepConv x2 -> GAP -> FC -> 6D
         self.repconv1 = RepConvBlock(320, 320, deploy=repconv_deploy)
@@ -187,6 +193,11 @@ class SixDRepNet_MobileNetV2(nn.Module):
         self.static_repconv2 = StaticRepConvBlock(320, 320)
         self.gap = nn.AdaptiveAvgPool2d(output_size=1)
         self.linear_reg = nn.Linear(320, 6)
+        # Optional decoupled 2D heads (yaw/pitch/roll); concat -> 6D.
+        # This is a model-only change and keeps output shape [B, 6].
+        self.yaw_reg_2d = nn.Linear(320, 2)
+        self.pitch_reg_2d = nn.Linear(320, 2)
+        self.roll_reg_2d = nn.Linear(320, 2)
     
     def forward(self, x):
         # stem
@@ -203,6 +214,7 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage3_3(x)
         x = self.stage3_lmfa(x)
         # x = self.stage3_alt_scse(x)
+        # x = self.stage3_alt_scse_eca(x)
 
         # stage4/5
         x = self.stage4_1(x)
@@ -210,28 +222,37 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage4_3(x)
         x = self.stage4_4(x)
         x = self.stage4_scse(x)
+        # x = self.stage4_scse_eca(x)
         x = self.stage5_1(x)
         x = self.stage5_2(x)
         x = self.stage5_3(x)
         x = self.stage5_lmfa(x)
         # x = self.stage5_alt_scse(x)
+        # x = self.stage5_alt_scse_eca(x)
 
         # stage6/7
         x = self.stage6_1(x)
         x = self.stage6_2(x)
         x = self.stage6_3(x)
         x = self.stage6_scse(x)
+        # x = self.stage6_scse_eca(x)
         x = self.stage7(x)
         if self.use_stage7_scse:
             x = self.stage7_scse(x)
+            # x = self.stage7_scse_eca(x)
 
         # head
-        x = self.repconv1(x)
-        x = self.repconv2(x)
+        # x = self.repconv1(x)
+        # x = self.repconv2(x)
         # x = self.static_repconv1(x)
         # x = self.static_repconv2(x)
         x = self.gap(x)
         x = torch.flatten(x, 1)
+        # Optional decoupled 2D head path:
+        # yaw_2d = self.yaw_reg_2d(x)
+        # pitch_2d = self.pitch_reg_2d(x)
+        # roll_2d = self.roll_reg_2d(x)
+        # x = torch.cat([yaw_2d, pitch_2d, roll_2d], dim=1)
         x = self.linear_reg(x)
         return x
 
@@ -459,24 +480,70 @@ class SCSEBlock(nn.Module):
         return x * c + x * s
 
 
+class ECAChannelGate(nn.Module):
+    """
+    ECA channel gate: GAP -> local cross-channel interaction -> gate.
+    """
+    def __init__(self, channels, k_size=3):
+        super(ECAChannelGate, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv1d = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.hsig = nn.Hardsigmoid(inplace=True)
+
+    def forward(self, x):
+        y = self.avg_pool(x)  # [B, C, 1, 1]
+        y = y.squeeze(-1).transpose(-1, -2)  # [B, 1, C]
+        y = self.conv1d(y)
+        y = self.hsig(y)
+        y = y.transpose(-1, -2).unsqueeze(-1)  # [B, C, 1, 1]
+        return y
+
+
+class SCSEECABlock(nn.Module):
+    """
+    scSE-ECA variant:
+    - cSE branch replaced with ECA channel gate
+    - sSE branch unchanged
+    """
+    def __init__(self, channels, eca_k_size=3):
+        super(SCSEECABlock, self).__init__()
+        self.eca_gate = ECAChannelGate(channels, k_size=eca_k_size)
+        self.sse_conv = nn.Conv2d(channels, 1, kernel_size=1, bias=True)
+        self.sse_hs = nn.Hardsigmoid(inplace=True)
+
+    def forward(self, x):
+        c = self.eca_gate(x)
+        s = self.sse_conv(x)
+        s = self.sse_hs(s)
+        return x * c + x * s
+
+
 class LMFABlock(nn.Module):
     def __init__(self, channels):
         super(LMFABlock, self).__init__()
         self.b1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1,
                             groups=channels, bias=False)
+        self.b1_bn = nn.BatchNorm2d(channels)
         self.b2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=2,
                             dilation=2, groups=channels, bias=False)
+        self.b2_bn = nn.BatchNorm2d(channels)
         self.b3 = nn.Conv2d(channels, channels, kernel_size=1, stride=1, padding=0, bias=False)
-        self.post_cat_scse = SCSEBlock(channels * 3)
-        self.fuse = nn.Conv2d(channels * 3, channels, kernel_size=1, stride=1, padding=0, bias=True)
+        self.b3_bn = nn.BatchNorm2d(channels)
+        self.fuse = nn.Conv2d(channels * 3, channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.fuse_bn = nn.BatchNorm2d(channels)
+        self.fuse_act = nn.ReLU6(inplace=True)
+        self.post_fuse_scse = SCSEECABlock(channels) # 使用scSE-ECA分支
         self.hsig = nn.Hardsigmoid(inplace=True)
 
     def forward(self, x):
-        z1 = self.b1(x)
-        z2 = self.b2(x)
-        z3 = self.b3(x)
+        z1 = self.b1_bn(self.b1(x))
+        z2 = self.b2_bn(self.b2(x))
+        z3 = self.b3_bn(self.b3(x))
         z = torch.cat([z1, z2, z3], dim=1)
-        z = self.post_cat_scse(z)
         z = self.fuse(z)
-        z = self.hsig(z)
+        z = self.fuse_bn(z)
+        z = self.fuse_act(z)
+        z = self.post_fuse_scse(z)
         return x + z
+        # z = self.hsig(z)
+        # return x * z
