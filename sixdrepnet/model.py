@@ -234,8 +234,8 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage6_1(x)
         x = self.stage6_2(x)
         x = self.stage6_3(x)
-        x = self.stage6_scse(x)
-        # x = self.stage6_scse_eca(x)
+        # x = self.stage6_scse(x)
+        x = self.stage6_scse_eca(x)
         x = self.stage7(x)
         
         # stage7_scse优先不加这一层
