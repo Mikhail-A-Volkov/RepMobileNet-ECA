@@ -2,7 +2,8 @@ import argparse
 
 import torch
 
-from model import SixDRepNet_MobileNetV2, mobilenet_model_convert
+from backbone.repconv import mobilenet_model_convert
+from model import SixDRepNet_MobileNetV2
 
 
 parser = argparse.ArgumentParser(description='SixDRepNet MobileNetV2 Conversion')
