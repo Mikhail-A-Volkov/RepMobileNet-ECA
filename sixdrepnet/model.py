@@ -124,7 +124,7 @@ class SixDRepNet_MobileNetV2(nn.Module):
     - Head: RepConv x2 -> GAP -> FC -> 6D
     - forward返回6D向量，旋转矩阵转换放到训练/测试后处理
     """
-    def __init__(self, pretrained=True, use_stage7_scse=True, use_CoordConv=False, repconv_deploy=False):
+    def __init__(self, pretrained=True, use_stage7_scse=False, use_CoordConv=False, repconv_deploy=False):
         super(SixDRepNet_MobileNetV2, self).__init__()
         mobilenet = mobilenet_v2(pretrained=pretrained)
 
@@ -171,15 +171,19 @@ class SixDRepNet_MobileNetV2(nn.Module):
         self.stage3_alt_scse = SCSEBlock(32)
         self.stage3_alt_scse_eca = SCSEECABlock(32)
         self.stage3_lmfa = LMFABlock(32)
+        self.stage3_light_lmfa = LightLMFA(32)
         self.stage5_alt_scse = SCSEBlock(96)
         self.stage5_alt_scse_eca = SCSEECABlock(96)
         self.stage5_lmfa = LMFABlock(96)
+        self.stage5_light_lmfa = LightLMFA(96)
 
         # stage4/stage6: 固定使用 scSE
         self.stage4_scse = SCSEBlock(64)
         self.stage4_scse_eca = SCSEECABlock(64)
+        self.stage4_light_scse = LightSCSEBlock(64)
         self.stage6_scse = SCSEBlock(160)
         self.stage6_scse_eca = SCSEECABlock(160)
+        self.stage6_eca = ECAChannelGate_VitisAI(160, k_size=3)
         self.use_stage7_scse = use_stage7_scse
         self.stage7_scse = SCSEBlock(320)
         self.stage7_scse_eca = SCSEECABlock(320)
@@ -213,7 +217,8 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage3_2(x)
         x = self.stage3_3(x)
         # x = self.stage3_lmfa(x)
-        x = self.stage3_alt_scse(x)
+        x = self.stage3_light_lmfa(x)
+        # x = self.stage3_alt_scse(x)
         # x = self.stage3_alt_scse_eca(x)
 
         # stage4/5
@@ -222,19 +227,22 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage4_3(x)
         x = self.stage4_4(x)
         x = self.stage4_scse(x)
+        # x = self.stage4_light_scse(x)
         # x = self.stage4_scse_eca(x)
         x = self.stage5_1(x)
         x = self.stage5_2(x)
         x = self.stage5_3(x)
         # x = self.stage5_lmfa(x)
-        x = self.stage5_alt_scse(x)
+        x = self.stage5_light_lmfa(x)
+        # x = self.stage5_alt_scse(x)
         # x = self.stage5_alt_scse_eca(x)
 
         # stage6/7
         x = self.stage6_1(x)
         x = self.stage6_2(x)
         x = self.stage6_3(x)
-        x = self.stage6_scse(x)
+        # x = self.stage6_scse(x)
+        x = x * self.stage6_eca(x)
         # x = self.stage6_scse_eca(x)
         x = self.stage7(x)
         
@@ -573,3 +581,62 @@ class LMFABlock(nn.Module):
         return x + z
         # z = self.hsig(z)
         # return x * z
+
+
+class LightLMFA(nn.Module):
+    """
+    DPU/Vitis-friendly light LMFA:
+    DWConv3x3 + DWConv3x3(dil=2) + DWConv1x1, concat, 1x1 fuse+BN,
+    then gated residual with learnable per-channel scale.
+    """
+    def __init__(self, channels):
+        super(LightLMFA, self).__init__()
+        self.b1 = nn.Conv2d(channels, channels, 3, 1, 1, groups=channels, bias=False)
+        self.b2 = nn.Conv2d(channels, channels, 3, 1, 2, dilation=2, groups=channels, bias=False)
+        self.b3 = nn.Conv2d(channels, channels, 1, 1, 0, groups=channels, bias=False)
+        self.fuse = nn.Conv2d(channels * 3, channels, 1, 1, 0, bias=False)
+        self.fuse_bn = nn.BatchNorm2d(channels)
+        self.hsig = nn.Hardsigmoid(inplace=True)
+
+    def forward(self, x):
+        z1 = self.b1(x)
+        z2 = self.b2(x)
+        z3 = self.b3(x)
+        z = torch.cat([z1, z2, z3], dim=1)
+        z = self.fuse(z)
+        z = self.fuse_bn(z)
+        gate = self.hsig(z)
+        return x + x * gate
+
+
+class LightSCSEBlock(nn.Module):
+    """
+    Lightweight scSE variant:
+    keep cSE branch; replace sSE 1x1 conv by depthwise 3x3 + pointwise 1x1.
+    """
+    def __init__(self, channels, reduction=16):
+        super(LightSCSEBlock, self).__init__()
+        reduced = max(channels // reduction, 1)
+        self.cse_pool = nn.AdaptiveAvgPool2d(1)
+        self.cse_fc1 = nn.Conv2d(channels, reduced, kernel_size=1, bias=True)
+        self.cse_relu = nn.ReLU(inplace=True)
+        self.cse_fc2 = nn.Conv2d(reduced, channels, kernel_size=1, bias=True)
+        self.cse_hs = nn.Hardsigmoid(inplace=True)
+
+        # sSE branch: depthwise 3x3 (spatial modeling) + pointwise 1x1 to 1 channel.
+        self.sse_dw3x3 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1,
+                                   groups=channels, bias=False)
+        self.sse_pw1x1 = nn.Conv2d(channels, 1, kernel_size=1, bias=True)
+        self.sse_hs = nn.Hardsigmoid(inplace=True)
+
+    def forward(self, x):
+        c = self.cse_pool(x)
+        c = self.cse_fc1(c)
+        c = self.cse_relu(c)
+        c = self.cse_fc2(c)
+        c = self.cse_hs(c)
+
+        s = self.sse_dw3x3(x)
+        s = self.sse_pw1x1(s)
+        s = self.sse_hs(s)
+        return x * c + x * s
