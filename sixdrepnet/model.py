@@ -124,7 +124,7 @@ class SixDRepNet_MobileNetV2(nn.Module):
     - Head: RepConv x2 -> GAP -> FC -> 6D
     - forward返回6D向量，旋转矩阵转换放到训练/测试后处理
     """
-    def __init__(self, pretrained=True, use_stage7_scse=False, use_CoordConv=False, repconv_deploy=False):
+    def __init__(self, pretrained=True, use_stage7_scse=True, use_CoordConv=False, repconv_deploy=False):
         super(SixDRepNet_MobileNetV2, self).__init__()
         mobilenet = mobilenet_v2(pretrained=pretrained)
 
@@ -213,7 +213,7 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage3_2(x)
         x = self.stage3_3(x)
         # x = self.stage3_lmfa(x)
-        # x = self.stage3_alt_scse(x)
+        x = self.stage3_alt_scse(x)
         # x = self.stage3_alt_scse_eca(x)
 
         # stage4/5
@@ -227,15 +227,15 @@ class SixDRepNet_MobileNetV2(nn.Module):
         x = self.stage5_2(x)
         x = self.stage5_3(x)
         # x = self.stage5_lmfa(x)
-        # x = self.stage5_alt_scse(x)
+        x = self.stage5_alt_scse(x)
         # x = self.stage5_alt_scse_eca(x)
 
         # stage6/7
         x = self.stage6_1(x)
         x = self.stage6_2(x)
         x = self.stage6_3(x)
-        # x = self.stage6_scse(x)
-        x = self.stage6_scse_eca(x)
+        x = self.stage6_scse(x)
+        # x = self.stage6_scse_eca(x)
         x = self.stage7(x)
         
         # stage7_scse优先不加这一层
