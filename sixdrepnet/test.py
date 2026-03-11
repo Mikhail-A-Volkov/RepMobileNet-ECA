@@ -149,6 +149,8 @@ if __name__ == '__main__':
     total = 0
     yaw_error = pitch_error = roll_error = .0
     v1_err = v2_err = v3_err = .0
+    total_infer_time = 0.0
+    total_infer_images = 0
 
     with torch.no_grad():
 
@@ -164,7 +166,15 @@ if __name__ == '__main__':
             p_gt_deg = cont_labels[:, 1].float()*180/np.pi
             r_gt_deg = cont_labels[:, 2].float()*180/np.pi
 
+            if use_gpu:
+                torch.cuda.synchronize(device)
+            infer_start = time.perf_counter()
             pred_out = model(images)
+            if use_gpu:
+                torch.cuda.synchronize(device)
+            infer_end = time.perf_counter()
+            total_infer_time += (infer_end - infer_start)
+            total_infer_images += images.size(0)
             R_pred = output_to_rotation_matrix(pred_out)
 
             euler = utils.compute_euler_angles_from_rotation_matrices(
@@ -209,6 +219,12 @@ if __name__ == '__main__':
         print('Yaw: %.4f, Pitch: %.4f, Roll: %.4f, MAE: %.4f' % (
             yaw_error / total, pitch_error / total, roll_error / total,
             (yaw_error + pitch_error + roll_error) / (total * 3)))
+        if total_infer_time > 0 and total_infer_images > 0:
+            fps = total_infer_images / total_infer_time
+            print('Inference FPS: %.4f (samples: %d, time: %.4fs)' % (
+                fps, total_infer_images, total_infer_time))
+        else:
+            print('Inference FPS: N/A (no valid timed samples)')
 
         # print('Vec1: %.4f, Vec2: %.4f, Vec3: %.4f, VMAE: %.4f' % (
         #     v1_err / total, v2_err / total, v3_err / total,

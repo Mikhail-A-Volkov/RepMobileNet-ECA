@@ -5,6 +5,7 @@ import sys
 import os
 import argparse
 import datetime
+import subprocess
 
 import numpy as np
 import cv2
@@ -102,7 +103,7 @@ def parse_args():
     parser.add_argument(
         '--optimizer_mode', dest='optimizer_mode',
         help='Optimizer mode: original (Adam) or improved (AdamW)',
-        default='original', type=str)
+        default='improved', type=str)
     parser.add_argument(
         '--weight_decay', dest='weight_decay',
         help='Weight decay for improved optimizer (AdamW)',
@@ -514,6 +515,7 @@ if __name__ == '__main__':
     best_val_loss = float('inf')
     best_val_mae = float('inf')
     best_epoch = -1
+    latest_best_model_path = ''
 
     print('Starting training.')
     for epoch in range(num_epochs):
@@ -683,6 +685,7 @@ if __name__ == '__main__':
             best_model_path = '../../../output/snapshots/{}/{}best_model.tar'.format(
                 summary_name, args.output_string + '_' if args.output_string else '')
             torch.save(checkpoint, best_model_path)
+            latest_best_model_path = best_model_path
             print('  *** New best model saved! (Val Loss: %.6f, Val MAE: %.4f) ***' % (
                 best_val_loss, best_val_mae))
         
@@ -691,3 +694,20 @@ if __name__ == '__main__':
     print('Training completed!')
     print('Best model: Epoch %d, Val Loss: %.6f, Val MAE: %.4f' % (
         best_epoch, best_val_loss, best_val_mae))
+
+    # 训练完成后自动运行测试，只传入 --snapshot
+    server_snapshot_path = '../../../output/snapshot/{}/best_model.tar'.format(summary_name)
+    snapshot_for_test = server_snapshot_path
+    if not os.path.exists(snapshot_for_test):
+        if latest_best_model_path and os.path.exists(latest_best_model_path):
+            snapshot_for_test = latest_best_model_path
+            print('Server snapshot path not found, fallback to local best model:')
+            print('  {}'.format(snapshot_for_test))
+        else:
+            print('Skip auto test: best model checkpoint not found.')
+            sys.exit(0)
+
+    test_script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'test.py')
+    print('Running test.py with snapshot:')
+    print('  {}'.format(snapshot_for_test))
+    subprocess.run([sys.executable, test_script_path, '--snapshot', snapshot_for_test], check=False)
